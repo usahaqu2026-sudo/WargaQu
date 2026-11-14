@@ -82,24 +82,49 @@ export function computeOptimalCardScale(
     0
   );
   const totalCards = Math.max(1, members.length + spouseCount);
-  const genLevels = new Set(members.map((m) => m.generationLevel ?? 0));
-  const genCount = Math.max(1, genLevels.size);
+  const genCounts = new Map<number, number>();
+  members.forEach((m) => {
+    const g = m.generationLevel ?? 0;
+    genCounts.set(g, (genCounts.get(g) ?? 0) + 1 + (m.spouses ? m.spouses.length : 0));
+  });
+  const genCount = Math.max(1, genCounts.size);
 
   const base1 = getBaseCardSizeForScale(displayMode, photoSize, 1);
-  const usableW = Math.max(320, boardWidth - 110);
-  const usableH = Math.max(260, boardHeight - 172);
+  const usableW = Math.max(320, boardWidth - 116);
+  const usableH = Math.max(260, boardHeight - 160);
+
+  const minAllowedScale = totalCards > 40 ? 0.38 : totalCards > 24 ? 0.45 : 0.55;
 
   // Target total area kartu + celah garis sekitar 58% dari bidang usable agar tetap bersih & penuh proporsional
   const targetCoverage = totalCards <= 10 ? 0.48 : 0.58;
-  const cellAreaAt1 = (base1.w + 26) * (base1.h + 44);
+  const cellAreaAt1 = (base1.w + 26) * (base1.h + 40);
   const rawScale = Math.sqrt((usableW * usableH * targetCoverage) / (totalCards * cellAreaAt1));
 
-  // Batas agar seluruh generasi tetap punya celah garis minimal secara vertikal
-  const maxVertScale =
-    (usableH - Math.max(1, genCount) * 34) / Math.max(1, genCount * base1.h);
+  // Estimasi jumlah sub-baris nyata (termasuk pembungkusan generasi padat) agar semua baris muat vertikal tanpa saling menumpuk
+  let candidate = Math.max(minAllowedScale, Math.min(1.45, rawScale));
+  for (let iter = 0; iter < 6; iter++) {
+    const cW = Math.max(46, base1.w * candidate);
+    const cH = Math.max(24, base1.h * candidate);
+    const gapX = Math.max(10, cW * 0.14);
+    const maxCols = Math.max(1, Math.floor((usableW + gapX) / (cW + gapX)));
+    let estSubRows = 0;
+    genCounts.forEach((cnt) => {
+      estSubRows += Math.max(1, Math.ceil(cnt / maxCols));
+    });
+    const minRowGap = Math.max(14, cH * 0.22);
+    const neededH = estSubRows * cH + Math.max(0, estSubRows - 1) * minRowGap;
+    if (neededH <= usableH || candidate <= minAllowedScale) {
+      break;
+    }
+    candidate = Math.max(minAllowedScale, candidate * 0.9);
+  }
 
-  const bounded = Math.min(rawScale, Math.max(0.55, maxVertScale));
-  const clamped = Math.max(0.55, Math.min(1.45, bounded));
+  // Batas vertikal minimal per generasi
+  const maxVertScale =
+    (usableH - Math.max(1, genCount) * 28) / Math.max(1, genCount * base1.h);
+
+  const bounded = Math.min(candidate, Math.max(minAllowedScale, maxVertScale));
+  const clamped = Math.max(minAllowedScale, Math.min(1.45, bounded));
   return Math.round(clamped * 20) / 20; // kelipatan 5% (0.05)
 }
 
@@ -417,13 +442,17 @@ export function generateSmartLayoutFromTable(
     const gapWeights = allSubRows.slice(1).map((sr) => (sr.isFirstInGen ? 1.45 : 1.0));
     const sumWeights = gapWeights.reduce((s, w) => s + w, 0) || 1;
 
-    const minSubRowGap = Math.max(26, Math.round(cardH * 0.28));
-    const maxUniformGap = Math.max(minSubRowGap + 24, Math.round(cardH * 0.95));
+    const desiredMinGap = Math.max(18, Math.round(cardH * 0.24));
+    const maxUniformGap = Math.max(desiredMinGap + 24, Math.round(cardH * 0.95));
+    // Jika banyak baris sehingga celah standar berisiko meluap ke bawah kertas, kompres celah secara proporsional agar semua baris muat tanpa menumpuk!
+    const adaptiveMinGap =
+      allSubRows.length > 1
+        ? Math.max(8, Math.min(desiredMinGap, Math.floor(rawAvailableGapTotal / sumWeights)))
+        : desiredMinGap;
 
-    // Jika total celah terlalu besar (keluarga kecil), batasi agar tidak berjauhan berlebihan tapi tetap memenuhi ruang atas-bawah dengan nyaman
     const effectiveGapTotal = Math.min(
       rawAvailableGapTotal,
-      Math.max(sumWeights * minSubRowGap, sumWeights * maxUniformGap)
+      Math.max(sumWeights * adaptiveMinGap, sumWeights * maxUniformGap)
     );
     const unitGapWeightPx = sumWeights > 0 ? effectiveGapTotal / sumWeights : 0;
 
@@ -433,7 +462,7 @@ export function generateSmartLayoutFromTable(
     allSubRows.forEach((sr, idx) => {
       if (idx > 0) {
         const w = sr.isFirstInGen ? 1.45 : 1.0;
-        curY += Math.max(minSubRowGap, Math.round(unitGapWeightPx * w));
+        curY += Math.max(adaptiveMinGap, Math.round(unitGapWeightPx * w));
       }
 
       const srUnits = sr.units;
@@ -950,11 +979,31 @@ function clampNodesSafe(
   cardW: number,
   cardH: number
 ): { nodes: InteractiveNode[]; edges: InteractiveEdge[] } {
-  const adjusted = nodes.map((n) => ({
-    ...n,
-    x: Math.max(16, Math.min(boardWidth - cardW - 16, Math.round(n.x))),
-    y: Math.max(66, Math.min(boardHeight - cardH - 16, Math.round(n.y))),
-  }));
+  if (nodes.length === 0) return { nodes, edges };
+
+  const minBoundX = 16;
+  const maxBoundX = Math.max(minBoundX + 10, boardWidth - cardW - 16);
+  const minBoundY = 66;
+  const maxBoundY = Math.max(minBoundY + 10, boardHeight - cardH - 16);
+
+  const curMinY = Math.min(...nodes.map((n) => n.y));
+  const curMaxY = Math.max(...nodes.map((n) => n.y));
+  const curSpanY = curMaxY - curMinY;
+  const availSpanY = maxBoundY - minBoundY;
+
+  // Jika baris paling bawah melampaui batas kertas, kompres Y secara proporsional agar TIDAK ada baris yang tergencet menumpuk di dasar kertas
+  const needYCompress = curMaxY > maxBoundY && curSpanY > availSpanY && curSpanY > 0;
+
+  const adjusted = nodes.map((n) => {
+    const rawY = needYCompress
+      ? minBoundY + ((n.y - curMinY) / curSpanY) * availSpanY
+      : n.y;
+    return {
+      ...n,
+      x: Math.max(minBoundX, Math.min(maxBoundX, Math.round(n.x))),
+      y: Math.max(minBoundY, Math.min(maxBoundY, Math.round(rawY))),
+    };
+  });
   return { nodes: adjusted, edges };
 }
 
@@ -981,11 +1030,27 @@ function clampAndCenterNodes(
     shiftX = 24 - minX;
   }
 
-  const adjusted = nodes.map((n) => ({
-    ...n,
-    x: Math.max(16, Math.min(boardWidth - cardW - 16, Math.round(n.x + shiftX))),
-    y: Math.max(66, Math.min(boardHeight - cardH - 16, Math.round(n.y))),
-  }));
+  const minBoundX = 16;
+  const maxBoundX = Math.max(minBoundX + 10, boardWidth - cardW - 16);
+  const minBoundY = 66;
+  const maxBoundY = Math.max(minBoundY + 10, boardHeight - cardH - 16);
+
+  const curMinY = Math.min(...nodes.map((n) => n.y));
+  const curMaxY = Math.max(...nodes.map((n) => n.y));
+  const curSpanY = curMaxY - curMinY;
+  const availSpanY = maxBoundY - minBoundY;
+  const needYCompress = curMaxY > maxBoundY && curSpanY > availSpanY && curSpanY > 0;
+
+  const adjusted = nodes.map((n) => {
+    const rawY = needYCompress
+      ? minBoundY + ((n.y - curMinY) / curSpanY) * availSpanY
+      : n.y;
+    return {
+      ...n,
+      x: Math.max(minBoundX, Math.min(maxBoundX, Math.round(n.x + shiftX))),
+      y: Math.max(minBoundY, Math.min(maxBoundY, Math.round(rawY))),
+    };
+  });
 
   return { nodes: adjusted, edges };
 }

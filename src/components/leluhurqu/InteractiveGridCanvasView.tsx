@@ -786,6 +786,307 @@ function buildConnectorRoute(
   };
 }
 
+function findNonOverlappingSlot(
+  preferredX: number,
+  preferredY: number,
+  cardW: number,
+  cardH: number,
+  boardW: number,
+  boardH: number,
+  occupied: Array<{ x: number; y: number; w: number; h: number }>
+): { x: number; y: number } {
+  const minX = 24;
+  const maxX = Math.max(minX, boardW - cardW - 24);
+  const minY = 72;
+  const maxY = Math.max(minY, boardH - cardH - 72);
+  const padX = 12;
+  const padY = 14;
+
+  const overlapsAny = (cx: number, cy: number) =>
+    occupied.some(
+      (b) =>
+        cx < b.x + b.w + padX &&
+        cx + cardW + padX > b.x &&
+        cy < b.y + b.h + padY &&
+        cy + cardH + padY > b.y
+    );
+
+  const clampedPrefX = Math.max(minX, Math.min(maxX, Math.round(preferredX / SNAP_SIZE) * SNAP_SIZE));
+  const clampedPrefY = Math.max(minY, Math.min(maxY, Math.round(preferredY / SNAP_SIZE) * SNAP_SIZE));
+  if (!overlapsAny(clampedPrefX, clampedPrefY)) {
+    return { x: clampedPrefX, y: clampedPrefY };
+  }
+
+  const stepX = Math.max(SNAP_SIZE, cardW + padX);
+  const stepY = Math.max(SNAP_SIZE, cardH + padY);
+
+  // Cari di sekitar baris preferredY terlebih dahulu (ke kanan / kiri), lalu geser ke baris bawah/atas
+  for (let rowOffset = 0; rowOffset <= 12; rowOffset++) {
+    const candidateYs =
+      rowOffset === 0
+        ? [clampedPrefY]
+        : [clampedPrefY + rowOffset * stepY, clampedPrefY - rowOffset * stepY];
+    for (const rawY of candidateYs) {
+      if (rawY < minY || rawY > maxY) continue;
+      for (let x = minX; x <= maxX; x += stepX) {
+        const sx = Math.round(x / SNAP_SIZE) * SNAP_SIZE;
+        const sy = Math.round(rawY / SNAP_SIZE) * SNAP_SIZE;
+        if (!overlapsAny(sx, sy)) {
+          return { x: sx, y: sy };
+        }
+      }
+    }
+  }
+
+  // Fallback penuh seluruh kertas agar tidak pernah menumpuk di pojok yang sama
+  for (let y = minY; y <= maxY; y += stepY) {
+    for (let x = minX; x <= maxX; x += stepX) {
+      const sx = Math.round(x / SNAP_SIZE) * SNAP_SIZE;
+      const sy = Math.round(y / SNAP_SIZE) * SNAP_SIZE;
+      if (!overlapsAny(sx, sy)) {
+        return { x: sx, y: sy };
+      }
+    }
+  }
+
+  return { x: clampedPrefX, y: clampedPrefY };
+}
+
+function reconcileCanvasWithMembers(
+  currentNodes: InteractiveNode[],
+  currentEdges: InteractiveEdge[],
+  members: FamilyMember[],
+  boardW: number,
+  boardH: number,
+  displayMode: CardDisplayMode,
+  photoSize: PhotoFrameSize,
+  currentScale: number,
+  forceAutoReflow: boolean
+): {
+  nodes: InteractiveNode[];
+  edges: InteractiveEdge[];
+  nextScale: number;
+  changed: boolean;
+  reflowed: boolean;
+} {
+  if (!members || members.length === 0) {
+    return {
+      nodes: currentNodes,
+      edges: currentEdges,
+      nextScale: currentScale,
+      changed: false,
+      reflowed: false,
+    };
+  }
+
+  const memberMap = new Map<string, FamilyMember>(members.map((m) => [m.id, m]));
+  let changed = false;
+
+  // 1. Perbarui metadata node yang terhubung & hapus node anggota yang sudah tidak ada di tabel
+  let updatedNodes: InteractiveNode[] = currentNodes
+    .filter((n) => {
+      if (n.memberId && !memberMap.has(n.memberId)) {
+        changed = true;
+        return false;
+      }
+      return true;
+    })
+    .map((n) => {
+      if (!n.memberId) return n;
+      const m = memberMap.get(n.memberId);
+      if (!m) return n;
+      const nextSub =
+        m.callName ||
+        (m.birthYear ? `Lahir ${m.birthYear}` : `Gen ${m.generationLevel}`);
+      const nextPhoto = m.photoUrl || n.photo;
+      if (
+        n.name !== m.name ||
+        n.sub !== nextSub ||
+        n.photo !== nextPhoto ||
+        n.wafat !== m.isDeceased ||
+        n.genLevel !== m.generationLevel
+      ) {
+        changed = true;
+        return {
+          ...n,
+          name: m.name,
+          sub: nextSub,
+          photo: nextPhoto,
+          wafat: m.isDeceased,
+          genLevel: m.generationLevel,
+        };
+      }
+      return n;
+    });
+
+  const survivingIds = new Set(updatedNodes.map((n) => n.id));
+  const updatedEdges: InteractiveEdge[] = currentEdges.filter((e) => {
+    const keep = survivingIds.has(e.from) && survivingIds.has(e.to);
+    if (!keep) changed = true;
+    return keep;
+  });
+
+  const presentMemberIds = new Set(
+    updatedNodes.map((n) => n.memberId).filter((id): id is string => Boolean(id))
+  );
+  const missingMembers = members.filter((m) => !presentMemberIds.has(m.id));
+
+  // Deteksi apakah kartu yang tersimpan mengalami penumpukan parah (mis. koordinat hampir sama)
+  let stackedPairs = 0;
+  if (updatedNodes.length >= 6) {
+    const coordBuckets = new Set<string>();
+    updatedNodes.forEach((n) => {
+      const bucket = `${Math.round(n.x / 18)}_${Math.round(n.y / 18)}`;
+      if (coordBuckets.has(bucket)) stackedPairs++;
+      else coordBuckets.add(bucket);
+    });
+  }
+  const hasSevereStacking =
+    updatedNodes.length >= 6 && stackedPairs >= Math.max(3, Math.floor(updatedNodes.length * 0.2));
+
+  const optScale = computeOptimalCardScale(
+    members,
+    boardW,
+    boardH,
+    displayMode,
+    photoSize
+  );
+
+  // Jika kanvas masih kosong, ada penambahan massal (>= 3 anggota baru, mis. Excel/Isi Cepat),
+  // mode auto aktif, skala saat ini terlalu besar untuk jumlah anggota baru, atau terdeteksi penumpukan -> tata ulang penuh rapi anti-tumpuk!
+  const shouldReflowAll =
+    updatedNodes.length === 0 ||
+    missingMembers.length >= 3 ||
+    hasSevereStacking ||
+    (missingMembers.length > 0 && (forceAutoReflow || currentScale > optScale + 0.1));
+
+  if (shouldReflowAll) {
+    const sampleDim = getNodeSize(
+      { id: 'tmp', name: 'Anggota Keluarga', sub: '', x: 0, y: 0, photo: '', wafat: false },
+      displayMode,
+      photoSize,
+      optScale
+    );
+    const rebuilt = generateSmartLayoutFromTable(
+      members,
+      members.length > 16 ? 'hierarchy_grid_fill' : 'subtree_vertical',
+      boardW,
+      boardH,
+      sampleDim
+    );
+    return {
+      nodes: rebuilt.nodes,
+      edges: rebuilt.edges,
+      nextScale: optScale,
+      changed: true,
+      reflowed: true,
+    };
+  }
+
+  // Penambahan ringan (1–2 anggota di Mode Manual): sisipkan ke slot kosong bebas-tabrakan
+  if (missingMembers.length > 0) {
+    changed = true;
+    const sampleDim = getNodeSize(
+      { id: 'tmp', name: 'Anggota Keluarga', sub: '', x: 0, y: 0, photo: '', wafat: false },
+      displayMode,
+      photoSize,
+      currentScale
+    );
+    const occupied = updatedNodes.map((n) => {
+      const sz = getNodeSize(n, displayMode, photoSize, currentScale);
+      return { x: n.x, y: n.y, w: sz.w, h: sz.h };
+    });
+
+    // Urutkan berdasarkan generationLevel agar orang tua selalu dibuat sebelum anaknya
+    const orderedMissing = [...missingMembers].sort(
+      (a, b) => (a.generationLevel || 0) - (b.generationLevel || 0) || (a.orderIndex || 0) - (b.orderIndex || 0)
+    );
+    const siblingOffsetByParent = new Map<string, number>();
+
+    orderedMissing.forEach((m, idx) => {
+      const parentNode = m.parentId
+        ? updatedNodes.find((n) => n.memberId === m.parentId || n.id === m.parentId)
+        : undefined;
+      const pKey = m.parentId || '__root__';
+      const sibIdx = siblingOffsetByParent.get(pKey) ?? 0;
+      siblingOffsetByParent.set(pKey, sibIdx + 1);
+
+      const prefX = parentNode
+        ? parentNode.x + sibIdx * (sampleDim.w + 22)
+        : 60 + idx * (sampleDim.w + 24);
+      const prefY = parentNode
+        ? parentNode.y + sampleDim.h + 48
+        : 80 + (m.generationLevel || 0) * (sampleDim.h + 48);
+
+      const spot = findNonOverlappingSlot(
+        prefX,
+        prefY,
+        sampleDim.w,
+        sampleDim.h,
+        boardW,
+        boardH,
+        occupied
+      );
+
+      const nodeId = `node_${m.id}`;
+      const newNode: InteractiveNode = {
+        id: nodeId,
+        memberId: m.id,
+        name: m.name,
+        sub:
+          m.callName ||
+          (m.birthYear ? `Lahir ${m.birthYear}` : `Gen ${m.generationLevel}`),
+        x: spot.x,
+        y: spot.y,
+        photo: m.photoUrl || '',
+        wafat: m.isDeceased,
+        genLevel: m.generationLevel,
+      };
+      updatedNodes.push(newNode);
+      occupied.push({ x: spot.x, y: spot.y, w: sampleDim.w, h: sampleDim.h });
+
+      if (parentNode) {
+        updatedEdges.push({ from: parentNode.id, to: nodeId, type: 'child' });
+      }
+
+      if (m.spouses && m.spouses.length > 0) {
+        m.spouses.forEach((sp, spIdx) => {
+          const spSpot = findNonOverlappingSlot(
+            spot.x + (spIdx + 1) * (sampleDim.w + 14),
+            spot.y,
+            sampleDim.w,
+            sampleDim.h,
+            boardW,
+            boardH,
+            occupied
+          );
+          const spNodeId = `node_${m.id}_sp_${spIdx}`;
+          updatedNodes.push({
+            id: spNodeId,
+            name: sp.name,
+            sub: 'Pasangan',
+            x: spSpot.x,
+            y: spSpot.y,
+            photo: '',
+            wafat: sp.status === 'cerai_mati',
+            genLevel: m.generationLevel,
+          });
+          occupied.push({ x: spSpot.x, y: spSpot.y, w: sampleDim.w, h: sampleDim.h });
+          updatedEdges.push({ from: nodeId, to: spNodeId, type: 'couple' });
+        });
+      }
+    });
+  }
+
+  return {
+    nodes: updatedNodes,
+    edges: updatedEdges,
+    nextScale: currentScale,
+    changed,
+    reflowed: false,
+  };
+}
+
 export const InteractiveGridCanvasView: React.FC<
   InteractiveGridCanvasViewProps
 > = ({ activeTrah, onOpenTable, showNotification, defaultCuratorName = '', defaultCreatedYear = '' }) => {
@@ -996,41 +1297,43 @@ export const InteractiveGridCanvasView: React.FC<
         loadedDesigns.find((d) => d.id === storedActiveId) || loadedDesigns[0];
       let nextDesigns = loadedDesigns;
 
-      // Jika desain masih kosong padahal Trah sudah punya anggota (mis. baru diisi di Excel/Buat Trah), auto-generate!
-      if (target.nodes.length === 0 && activeTrah.members.length > 0) {
+      // Sinkronkan desain tersimpan dengan data anggota terbaru (mis. saat baru tambah/impor banyak anggota di Excel lalu kembali ke Grid!)
+      if (activeTrah.members.length > 0) {
         const pKey = target.paperSize || 'a3';
         const pDim = GRID_PAPER_MAP[pKey];
         const pW = (target.paperOrientation || 'landscape') === 'landscape' ? pDim.pxW : pDim.pxH;
         const pH = (target.paperOrientation || 'landscape') === 'landscape' ? pDim.pxH : pDim.pxW;
         const cMode = target.cardDisplayMode || 'full';
         const phSize = target.photoFrameSize || '3x4';
-        const optScale = computeOptimalCardScale(activeTrah.members, pW, pH, cMode, phSize);
-        const cardDim = getNodeSize(
-          { id: 'tmp', name: 'Anggota Keluarga', sub: '', x: 0, y: 0, photo: '', wafat: false },
-          cMode,
-          phSize,
-          optScale
-        );
-        const rebuilt = generateSmartLayoutFromTable(
+        const curScale = target.cardScale ?? 1;
+
+        const reconciled = reconcileCanvasWithMembers(
+          target.nodes,
+          target.edges,
           activeTrah.members,
-          activeTrah.members.length > 16 ? 'hierarchy_grid_fill' : 'subtree_vertical',
           pW,
           pH,
-          cardDim
+          cMode,
+          phSize,
+          curScale,
+          false
         );
-        target = {
-          ...target,
-          nodes: rebuilt.nodes,
-          edges: rebuilt.edges,
-          quickText: buildQuickTextFromTrah(activeTrah.members),
-          cardScale: optScale,
-          updatedAt: Date.now(),
-        };
-        nextDesigns = loadedDesigns.map((d) => (d.id === target.id ? target : d));
-        try {
-          localStorage.setItem(designsStorageKey, JSON.stringify(nextDesigns));
-        } catch (err) {
-          console.warn(err);
+
+        if (reconciled.changed) {
+          target = {
+            ...target,
+            nodes: reconciled.nodes,
+            edges: reconciled.edges,
+            quickText: buildQuickTextFromTrah(activeTrah.members),
+            cardScale: reconciled.nextScale,
+            updatedAt: Date.now(),
+          };
+          nextDesigns = loadedDesigns.map((d) => (d.id === target.id ? target : d));
+          try {
+            localStorage.setItem(designsStorageKey, JSON.stringify(nextDesigns));
+          } catch (err) {
+            console.warn(err);
+          }
         }
       }
 
@@ -1148,7 +1451,8 @@ export const InteractiveGridCanvasView: React.FC<
     (
       overrideNodes?: InteractiveNode[],
       overrideEdges?: InteractiveEdge[],
-      overrideQuickText?: string
+      overrideQuickText?: string,
+      overrideCardScale?: number
     ) => {
       if (!activeDesignId) return;
       setSavedDesigns((prev) => {
@@ -1164,7 +1468,7 @@ export const InteractiveGridCanvasView: React.FC<
                 paperOrientation,
                 cardDisplayMode,
                 photoFrameSize,
-                cardScale,
+                cardScale: overrideCardScale ?? cardScale,
                 showGenGuides,
                 linesOnTop,
                 theme,
@@ -1243,140 +1547,30 @@ export const InteractiveGridCanvasView: React.FC<
     lastMemberSigRef.current = nextSig;
 
     const refreshedQuickText = buildQuickTextFromTrah(activeTrah.members);
+    const reconciled = reconcileCanvasWithMembers(
+      nodes,
+      edges,
+      activeTrah.members,
+      boardWidth,
+      boardHeight,
+      cardDisplayMode,
+      photoFrameSize,
+      cardScale,
+      layoutMode === 'auto'
+    );
 
-    if (nodes.length === 0 && activeTrah.members.length > 0) {
-      const optScale = computeOptimalCardScale(
-        activeTrah.members,
-        boardWidth,
-        boardHeight,
-        cardDisplayMode,
-        photoFrameSize
-      );
-      setCardScale(optScale);
-      const sampleDim = getNodeSize(
-        { id: 'tmp', name: 'Anggota Keluarga', sub: '', x: 0, y: 0, photo: '', wafat: false },
-        cardDisplayMode,
-        photoFrameSize,
-        optScale
-      );
-      const rebuilt = generateSmartLayoutFromTable(
-        activeTrah.members,
-        activeTrah.members.length > 16 ? 'hierarchy_grid_fill' : 'subtree_vertical',
-        boardWidth,
-        boardHeight,
-        sampleDim
-      );
-      setNodes(rebuilt.nodes);
-      setEdges(rebuilt.edges);
-      setQuickText(refreshedQuickText);
-      persistCurrentDesign(rebuilt.nodes, rebuilt.edges, refreshedQuickText);
-      return;
+    if (reconciled.nextScale !== cardScale) {
+      setCardScale(reconciled.nextScale);
     }
-
-    const memberMap = new Map<string, FamilyMember>(
-      activeTrah.members.map((m) => [m.id, m])
-    );
-
-    // 1. Perbarui metadata node yang sudah terhubung & buang node member yang telah dihapus di Excel
-    let updatedNodes: InteractiveNode[] = nodes
-      .filter((n) => !n.memberId || memberMap.has(n.memberId))
-      .map((n) => {
-        if (!n.memberId) return n;
-        const m = memberMap.get(n.memberId);
-        if (!m) return n;
-        const subText =
-          m.callName ||
-          (m.birthYear ? `Lahir ${m.birthYear}` : `Gen ${m.generationLevel}`);
-        return {
-          ...n,
-          name: m.name,
-          sub: subText,
-          photo: m.photoUrl || n.photo,
-          wafat: m.isDeceased,
-          genLevel: m.generationLevel,
-        };
-      });
-
-    const survivingIds = new Set(updatedNodes.map((n) => n.id));
-    const updatedEdges: InteractiveEdge[] = edges.filter(
-      (e) => survivingIds.has(e.from) && survivingIds.has(e.to)
-    );
-
-    // 2. Tambahkan member baru yang belum ada di Kanvas Grid
-    const presentMemberIds = new Set(
-      updatedNodes.map((n) => n.memberId).filter((id): id is string => Boolean(id))
-    );
-    const missingMembers = activeTrah.members.filter(
-      (m) => !presentMemberIds.has(m.id)
-    );
-
-    if (missingMembers.length > 0) {
-      const sampleDim = getNodeSize(
-        { id: 'tmp', name: 'Anggota Keluarga', sub: '', x: 0, y: 0, photo: '', wafat: false },
-        cardDisplayMode,
-        photoFrameSize,
-        cardScale
-      );
-      const siblingOffsetByParent = new Map<string, number>();
-
-      missingMembers.forEach((m, idx) => {
-        const parentNode = m.parentId
-          ? updatedNodes.find((n) => n.memberId === m.parentId || n.id === m.parentId)
-          : undefined;
-        const pKey = m.parentId || '__root__';
-        const sibIdx = siblingOffsetByParent.get(pKey) ?? 0;
-        siblingOffsetByParent.set(pKey, sibIdx + 1);
-
-        const baseX = parentNode
-          ? Math.max(40, Math.min(boardWidth - sampleDim.w - 40, parentNode.x + sibIdx * (sampleDim.w + 26)))
-          : 80 + idx * (sampleDim.w + 30);
-        const baseY = parentNode
-          ? Math.min(boardHeight - sampleDim.h - 80, parentNode.y + sampleDim.h + 64)
-          : 90 + m.generationLevel * (sampleDim.h + 64);
-
-        const nodeId = `node_${m.id}`;
-        const newNode: InteractiveNode = {
-          id: nodeId,
-          memberId: m.id,
-          name: m.name,
-          sub:
-            m.callName ||
-            (m.birthYear ? `Lahir ${m.birthYear}` : `Gen ${m.generationLevel}`),
-          x: Math.round(baseX / SNAP_SIZE) * SNAP_SIZE,
-          y: Math.round(baseY / SNAP_SIZE) * SNAP_SIZE,
-          photo: m.photoUrl || '',
-          wafat: m.isDeceased,
-          genLevel: m.generationLevel,
-        };
-        updatedNodes.push(newNode);
-
-        if (parentNode) {
-          updatedEdges.push({ from: parentNode.id, to: nodeId, type: 'child' });
-        }
-
-        if (m.spouses && m.spouses.length > 0) {
-          m.spouses.forEach((sp, spIdx) => {
-            const spNodeId = `node_${m.id}_sp_${spIdx}`;
-            updatedNodes.push({
-              id: spNodeId,
-              name: sp.name,
-              sub: 'Pasangan',
-              x: Math.round((newNode.x + (spIdx + 1) * (sampleDim.w + 18)) / SNAP_SIZE) * SNAP_SIZE,
-              y: newNode.y,
-              photo: '',
-              wafat: sp.status === 'cerai_mati',
-              genLevel: m.generationLevel,
-            });
-            updatedEdges.push({ from: nodeId, to: spNodeId, type: 'couple' });
-          });
-        }
-      });
-    }
-
-    setNodes(updatedNodes);
-    setEdges(updatedEdges);
+    setNodes(reconciled.nodes);
+    setEdges(reconciled.edges);
     setQuickText(refreshedQuickText);
-    persistCurrentDesign(updatedNodes, updatedEdges, refreshedQuickText);
+    persistCurrentDesign(
+      reconciled.nodes,
+      reconciled.edges,
+      refreshedQuickText,
+      reconciled.nextScale
+    );
   }, [activeTrah.id, activeTrah.members, activeDesignId]);
 
   // Auto-Fit kanvas ke viewport layar (menyesuaikan lebar & tinggi agar kertas Potret/Lanskap utuh)
