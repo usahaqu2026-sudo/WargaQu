@@ -117,6 +117,7 @@ export interface TrahComment {
 export interface TrahPost {
   id: string;
   trahId: string;
+  trahName?: string;
   lineageSide: LineageSide;
   authorName: string;
   authorKinship: string;
@@ -139,7 +140,7 @@ interface LeluhurQuViewProps {
   onOpenChatQu?: () => void;
 }
 
-// Kunci penyimpanan localStorage dengan fallback berjenjang agar data pengguna tidak pernah terhapus
+// Kunci penyimpanan localStorage per-akun agar privasi tiap akun terpisah (user baru tidak melihat data contoh/akun lain)
 const STORAGE_KEYS = [
   'wargaqu_leluhur_trah_v4',
   'wargaqu_leluhur_trah_v3',
@@ -148,10 +149,113 @@ const STORAGE_KEYS = [
 ];
 const ACTIVE_STORAGE_KEY = 'wargaqu_leluhur_trah_v4';
 const TRAH_POSTS_STORAGE_KEY = 'wargaqu_leluhur_posts_v1';
+const PENDING_INVITE_KEY = 'wargaqu_pending_trah_invite_v1';
+const OWNER_EMAILS = ['usahaqu2026@gmail.com', 'usahaqu26@gmail.com'];
 
 const PHOTO_SHAPE_KEY = 'wargaqu_leluhur_photo_shape';
 const ACCOUNT_PROFILE_KEY = 'wargaqu_leluhur_account_v1';
 const APP_PREFS_KEY = 'wargaqu_leluhur_prefs_v1';
+
+const EMPTY_TRAH_PLACEHOLDER: TrahCategory = {
+  id: '__empty__',
+  name: 'Belum Ada Trah',
+  description: 'Buat Trah baru atau gabung lewat undangan keluarga',
+  lineageSide: 'umum',
+  members: [],
+};
+
+function getCurrentAccountScope() {
+  const acc = AuthService.getAccount();
+  const email = (acc?.email || '').trim().toLowerCase();
+  const scopeKey = email ? email.replace(/[^a-z0-9@._-]/g, '_') : 'guest';
+  const isOwner = OWNER_EMAILS.includes(email);
+  return { email, scopeKey, isOwner };
+}
+
+function getScopedTrahStorageKey(scopeKey: string): string {
+  return `wargaqu_leluhur_trah_v5_${scopeKey}`;
+}
+
+function getScopedPostsStorageKey(scopeKey: string): string {
+  return `wargaqu_leluhur_posts_v2_${scopeKey}`;
+}
+
+function encodeTrahInviteToken(trah: TrahCategory, inviterName: string): string {
+  const compactPayload = {
+    v: 1,
+    inviter: inviterName || 'Keluarga',
+    invitedAt: new Date().toISOString(),
+    trah: {
+      id: trah.id,
+      name: trah.name,
+      description: trah.description,
+      lineageSide: trah.lineageSide || 'umum',
+      members: trah.members || [],
+    },
+  };
+  const json = JSON.stringify(compactPayload);
+  const bytes = new TextEncoder().encode(json);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return `LQH1:${btoa(bin)}`;
+}
+
+function decodeTrahInviteInput(
+  rawInput: string
+): { trah: TrahCategory; inviter: string } | null {
+  const trimmed = (rawInput || '').trim();
+  if (!trimmed) return null;
+
+  let token = trimmed;
+  if (trimmed.includes('trahInvite=')) {
+    try {
+      const idx = trimmed.indexOf('?');
+      const searchStr = idx >= 0 ? trimmed.slice(idx) : `?${trimmed}`;
+      const params = new URLSearchParams(searchStr);
+      const extracted = params.get('trahInvite');
+      if (extracted) token = extracted.trim();
+    } catch {
+      // keep raw
+    }
+  }
+
+  if (token.startsWith('LQH1:')) {
+    token = token.slice(5);
+  } else {
+    return null;
+  }
+
+  try {
+    const bin = atob(token);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    const json = new TextDecoder().decode(bytes);
+    const parsed = JSON.parse(json) as {
+      v?: number;
+      inviter?: string;
+      trah?: Partial<TrahCategory>;
+    };
+    if (!parsed.trah || !parsed.trah.id || !parsed.trah.name) return null;
+    const rawMembers = Array.isArray(parsed.trah.members) ? parsed.trah.members : [];
+    const trah: TrahCategory = {
+      id: parsed.trah.id,
+      name: parsed.trah.name,
+      description: parsed.trah.description || 'Trah Undangan Keluarga',
+      lineageSide: parsed.trah.lineageSide || 'umum',
+      members: rawMembers,
+    };
+    return {
+      trah,
+      inviter: parsed.inviter || 'Keluarga',
+    };
+  } catch {
+    return null;
+  }
+}
 
 const DEFAULT_ACCOUNT_PROFILE: LeluhurAccountProfile = {
   displayName: 'Ian (Anda)',
@@ -921,8 +1025,39 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
   showNotification,
   onOpenChatQu
 }) => {
-  // Pemuatan data cerdas & migrasi otomatis: pastikan Trah Santa selalu masuk ke Pilar Trah Ayah (lineageSide: 'ayah_user')
-  const [trahList, setTrahList] = useState<TrahCategory[]>(() => {
+  const [accountScope, setAccountScope] = useState(() => getCurrentAccountScope());
+
+  const loadTrahListForScope = (scope: { email: string; scopeKey: string; isOwner: boolean }): TrahCategory[] => {
+    const scopedKey = getScopedTrahStorageKey(scope.scopeKey);
+    try {
+      const scopedRaw = localStorage.getItem(scopedKey);
+      if (scopedRaw !== null) {
+        const parsed = JSON.parse(scopedRaw);
+        if (Array.isArray(parsed)) {
+          return parsed.map((t: TrahCategory) => ({
+            ...t,
+            members: normalizeTrahMembers(
+              t.members || [],
+              t.id === 'trah-ayah-user' || t.name?.toUpperCase().includes('SANTA')
+            ).members,
+          }));
+        }
+      }
+    } catch (e) {
+      console.warn('Gagal membaca scoped trah key:', scopedKey, e);
+    }
+
+    // User baru / akun non-pemilik: mulai bersih (0 Trah) sampai membuat sendiri atau menerima undangan
+    if (!scope.isOwner) {
+      try {
+        localStorage.setItem(scopedKey, JSON.stringify([]));
+      } catch {
+        // ignore
+      }
+      return [];
+    }
+
+    // Khusus akun pemilik: migrasi data 4 Trah sebelumnya dari key v4..v1 agar tidak hilang
     let rawList: TrahCategory[] = [];
     for (const key of STORAGE_KEYS) {
       try {
@@ -943,8 +1078,6 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       rawList = DEFAULT_TRAH_DATA;
     }
 
-    // NORMALISASI & MIGRASI: Pastikan TRAH SANTA pasti berada di Pilar Trah Ayah ('ayah_user')
-    // 1. Cari apakah ada trah Santa di daftar (berdasarkan ID 'trah-santa', nama mengandung 'SANTA', atau leluhur 'Santa')
     const santaIndex = rawList.findIndex(
       (t) =>
         t.id === 'trah-santa' ||
@@ -972,8 +1105,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       migratedSanta = DEFAULT_TRAH_DATA[0];
     }
 
-    // Bangun daftar terupdate di mana Trah Santa adalah Pilar Ayah (posisi pertama)
-    let otherTrahs = rawList
+    const otherTrahs = rawList
       .filter(
         (t, idx) =>
           idx !== santaIndex &&
@@ -986,25 +1118,55 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
         members: normalizeTrahMembers(t.members || [], false).members,
       }));
 
-    // Pastikan pilar Ibu tetap ada jika belum ada
     const hasIbu = otherTrahs.some((t) => t.lineageSide === 'ibu_user' || t.id === 'trah-ibu-user');
     if (!hasIbu && DEFAULT_TRAH_DATA[1]) {
       otherTrahs.push(DEFAULT_TRAH_DATA[1]);
     }
 
     const finalList = [migratedSanta, ...otherTrahs];
-
-    // Simpan ke storage versi aktif agar langsung sinkron
     try {
-      localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(finalList));
+      localStorage.setItem(scopedKey, JSON.stringify(finalList));
     } catch (e) {
       console.warn('Gagal menyimpan migrasi trah:', e);
     }
-
     return finalList;
-  });
+  };
 
-  const [activeTrahId, setActiveTrahId] = useState<string>('trah-ayah-user');
+  const loadPostsForScope = (scope: { email: string; scopeKey: string; isOwner: boolean }): TrahPost[] => {
+    const scopedPostsKey = getScopedPostsStorageKey(scope.scopeKey);
+    try {
+      const savedScoped = localStorage.getItem(scopedPostsKey);
+      if (savedScoped !== null) {
+        const parsed = JSON.parse(savedScoped);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch (e) {
+      console.warn('Gagal membaca scoped posts:', e);
+    }
+
+    if (!scope.isOwner) {
+      return [];
+    }
+
+    try {
+      const legacy = localStorage.getItem(TRAH_POSTS_STORAGE_KEY);
+      if (legacy) {
+        const parsed = JSON.parse(legacy);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (e) {
+      console.warn('Gagal membaca trah posts:', e);
+    }
+    return DEFAULT_TRAH_POSTS;
+  };
+
+  const [trahList, setTrahList] = useState<TrahCategory[]>(() => loadTrahListForScope(accountScope));
+
+  const [activeTrahId, setActiveTrahId] = useState<string>(() => {
+    const initial = loadTrahListForScope(getCurrentAccountScope());
+    return initial[0]?.id || '';
+  });
+  const [inviteJoinInput, setInviteJoinInput] = useState<string>('');
   const [exportFeeModal, setExportFeeModal] = useState<{
     open: boolean;
     actionLabel: string;
@@ -1042,22 +1204,11 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     return appPreferences.defaultStartMenu || 'grid';
   });
 
-  // State Postingan Medsos Khusus 4 Trah (TrahBook)
-  const [trahPosts, setTrahPosts] = useState<TrahPost[]>(() => {
-    try {
-      const saved = localStorage.getItem(TRAH_POSTS_STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch (e) {
-      console.warn('Gagal membaca trah posts:', e);
-    }
-    return DEFAULT_TRAH_POSTS;
-  });
+  // State Postingan Medsos TrahBook (terisolasi per-akun)
+  const [trahPosts, setTrahPosts] = useState<TrahPost[]>(() => loadPostsForScope(accountScope));
 
-  // Filter Tab Medsos (Semua 4 Trah, atau Trah Tertentu)
-  const [feedPillarFilter, setFeedPillarFilter] = useState<'all' | LineageSide>('all');
+  // Filter Tab Medsos ('all' atau trahId tertentu agar semua Trah modular otomatis terhubung)
+  const [feedPillarFilter, setFeedPillarFilter] = useState<string>('all');
   const [newPostContent, setNewPostContent] = useState<string>('');
   const [newPostCategory, setNewPostCategory] = useState<'kabar_gembira' | 'silaturahmi' | 'sejarah' | 'lelayu'>('silaturahmi');
   const [newPostImageUrl, setNewPostImageUrl] = useState<string>('');
@@ -1112,11 +1263,18 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
   const [quickShowAddParent, setQuickShowAddParent] = useState<boolean>(false);
   const [quickNewRootName, setQuickNewRootName] = useState<string>('');
 
-  // Add Trah Modal
+  // Add Trah Modal (Modular Trah + Silsilah Awal + Sinkron Lintas Submenu)
   const [isAddTrahModalOpen, setIsAddTrahModalOpen] = useState<boolean>(false);
   const [newTrahName, setNewTrahName] = useState<string>('');
   const [newTrahDesc, setNewTrahDesc] = useState<string>('');
   const [newTrahLineage, setNewTrahLineage] = useState<LineageSide>('ayah_user');
+  const [newTrahRootName, setNewTrahRootName] = useState<string>('');
+  const [newTrahRootGender, setNewTrahRootGender] = useState<'L' | 'P'>('L');
+  const [newTrahRootDeceased, setNewTrahRootDeceased] = useState<boolean>(false);
+  const [newTrahRootSpouse, setNewTrahRootSpouse] = useState<string>('');
+  const [newTrahChildrenInput, setNewTrahChildrenInput] = useState<string>('');
+  const [newTrahCreateIntroPost, setNewTrahCreateIntroPost] = useState<boolean>(true);
+  const [newTrahTargetView, setNewTrahTargetView] = useState<'stay' | 'grid' | 'excel' | 'feed'>('grid');
 
   // Modal Undangan Silsilah Trah Medsos (WA / ChatQu / Salin Link)
   const [isInviteModalOpen, setIsInviteModalOpen] = useState<boolean>(false);
@@ -1131,22 +1289,31 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
   // Modal Buku Leluhur PDF (Pratinjau A4/A5/A6 + Unduh PDF + Bagan Akhir Nama)
   const [isBookModalOpen, setIsBookModalOpen] = useState<boolean>(false);
 
-  // Simpan data & preferensi otomatis
+  const activeTrahStorageKey = getScopedTrahStorageKey(accountScope.scopeKey);
+  const activePostsStorageKey = getScopedPostsStorageKey(accountScope.scopeKey);
+
+  // Simpan data & preferensi otomatis per-akun
   useEffect(() => {
     try {
-      localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(trahList));
+      localStorage.setItem(activeTrahStorageKey, JSON.stringify(trahList));
+      if (accountScope.isOwner) {
+        localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(trahList));
+      }
     } catch (e) {
       console.error('Failed to save trah list', e);
     }
-  }, [trahList]);
+  }, [trahList, activeTrahStorageKey, accountScope.isOwner]);
 
   useEffect(() => {
     try {
-      localStorage.setItem(TRAH_POSTS_STORAGE_KEY, JSON.stringify(trahPosts));
+      localStorage.setItem(activePostsStorageKey, JSON.stringify(trahPosts));
+      if (accountScope.isOwner) {
+        localStorage.setItem(TRAH_POSTS_STORAGE_KEY, JSON.stringify(trahPosts));
+      }
     } catch (e) {
       console.error('Failed to save trah posts', e);
     }
-  }, [trahPosts]);
+  }, [trahPosts, activePostsStorageKey, accountScope.isOwner]);
 
   useEffect(() => {
     try {
@@ -1158,6 +1325,19 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
 
   useEffect(() => {
     const syncFromAuth = () => {
+      const nextScope = getCurrentAccountScope();
+      setAccountScope((prevScope) => {
+        if (prevScope.scopeKey !== nextScope.scopeKey) {
+          const nextTrahs = loadTrahListForScope(nextScope);
+          const nextPosts = loadPostsForScope(nextScope);
+          setTrahList(nextTrahs);
+          setTrahPosts(nextPosts);
+          setActiveTrahId(nextTrahs[0]?.id || '');
+          setFeedPillarFilter('all');
+        }
+        return nextScope;
+      });
+
       const acc = AuthService.getAccount();
       if (!acc) return;
       const displayName = AuthService.getDisplayName(acc);
@@ -1180,6 +1360,48 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     return () => window.removeEventListener(AUTH_SYNC_EVENT, syncFromAuth);
   }, []);
 
+  const handleAcceptTrahInvite = (rawTokenOrUrl: string): boolean => {
+    const decoded = decodeTrahInviteInput(rawTokenOrUrl);
+    if (!decoded) {
+      showNotification('Kode atau link undangan Trah tidak valid.');
+      return false;
+    }
+
+    const { trah: rawInvited, inviter } = decoded;
+    const normalizedInvited: TrahCategory = {
+      ...rawInvited,
+      members: normalizeTrahMembers(rawInvited.members || [], false).members,
+    };
+
+    setTrahList((prev) => {
+      const existsIdx = prev.findIndex((t) => t.id === normalizedInvited.id);
+      if (existsIdx !== -1) {
+        return prev.map((t, i) => (i === existsIdx ? normalizedInvited : t));
+      }
+      return [normalizedInvited, ...prev];
+    });
+    setActiveTrahId(normalizedInvited.id);
+    setInviteJoinInput('');
+    setViewMode('grid');
+    showNotification(
+      `Undangan diterima! Trah "${normalizedInvited.name}" dari ${inviter} (${normalizedInvited.members.length} anggota) dibuka.`
+    );
+    return true;
+  };
+
+  // Proses otomatis undangan Trah yang masuk lewat URL (?trahInvite=...)
+  useEffect(() => {
+    try {
+      const pending = localStorage.getItem(PENDING_INVITE_KEY);
+      if (pending && pending.trim()) {
+        localStorage.removeItem(PENDING_INVITE_KEY);
+        handleAcceptTrahInvite(pending);
+      }
+    } catch {
+      // ignore
+    }
+  }, [accountScope.scopeKey]);
+
   useEffect(() => {
     try {
       localStorage.setItem(APP_PREFS_KEY, JSON.stringify(appPreferences));
@@ -1194,6 +1416,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
   }, [quickCommaInput]);
 
   const activeTrah = useMemo(() => {
+    if (trahList.length === 0) return EMPTY_TRAH_PLACEHOLDER;
     const found = trahList.find((t) => t.id === activeTrahId);
     if (found) return found;
     if (activeTrahId === 'trah-santa') {
@@ -1202,7 +1425,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     }
     const fallbackAyah = trahList.find((t) => t.lineageSide === 'ayah_user');
     if (fallbackAyah) return fallbackAyah;
-    return trahList[0] || DEFAULT_TRAH_DATA[0];
+    return trahList[0];
   }, [trahList, activeTrahId]);
 
   useEffect(() => {
@@ -1326,7 +1549,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
 
     setTrahList(updatedTrahList);
     try {
-      localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(updatedTrahList));
+      localStorage.setItem(activeTrahStorageKey, JSON.stringify(updatedTrahList));
     } catch (e) {
       console.warn(e);
     }
@@ -1481,7 +1704,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     setTrahList(updatedTrahList);
     setActiveTrahId(currentTrah.id);
     try {
-      localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(updatedTrahList));
+      localStorage.setItem(activeTrahStorageKey, JSON.stringify(updatedTrahList));
     } catch (err) {
       console.warn('Storage sync err:', err);
     }
@@ -1780,21 +2003,117 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       return;
     }
 
+    const nowTs = Date.now();
+    const formattedTrahName = newTrahName.trim().toUpperCase();
+    const descText = newTrahDesc.trim() || 'Keluarga Besar Silsilah Trah';
+    const rootNameTrim = newTrahRootName.trim();
+    const parsedChildren = parseCommaChildren(newTrahChildrenInput);
+    const hasInitialTree = rootNameTrim.length > 0 || parsedChildren.length > 0;
+
+    const initialMembers: FamilyMember[] = [];
+    if (hasInitialTree) {
+      const rootId = `m_${nowTs}_0`;
+      const spouseNameTrim = newTrahRootSpouse.trim();
+      const rootMember: FamilyMember = {
+        id: rootId,
+        name: rootNameTrim || `Leluhur ${formattedTrahName}`,
+        callName: rootNameTrim ? undefined : formattedTrahName,
+        isDeceased: newTrahRootDeceased,
+        gender: newTrahRootGender,
+        parentId: null,
+        generationLevel: 0,
+        orderIndex: 1,
+        notes: `Leluhur Utama ${formattedTrahName}`,
+        spouses: spouseNameTrim
+          ? [
+              {
+                id: `sp_${nowTs}_0`,
+                name: spouseNameTrim,
+                orderIndex: 1,
+                status: 'menikah',
+              },
+            ]
+          : [],
+      };
+      initialMembers.push(rootMember);
+
+      parsedChildren.forEach((child, idx) => {
+        initialMembers.push({
+          id: `m_${nowTs}_${idx + 1}`,
+          name: child.name,
+          isDeceased: false,
+          gender: child.gender,
+          parentId: rootId,
+          generationLevel: 1,
+          orderIndex: child.orderIndex,
+          spouses: [],
+        });
+      });
+    }
+
     const newTrah: TrahCategory = {
-      id: `trah_${Date.now()}`,
-      name: newTrahName.trim().toUpperCase(),
-      description: newTrahDesc.trim() || 'Keluarga Besar Silsilah Trah',
+      id: `trah_${nowTs}`,
+      name: formattedTrahName,
+      description: descText,
       lineageSide: newTrahLineage,
-      members: []
+      members: initialMembers,
     };
 
     setTrahList((prev) => [...prev, newTrah]);
     setActiveTrahId(newTrah.id);
+
+    if (newTrahCreateIntroPost) {
+      const introLines = [
+        `🌳 Trah baru "${newTrah.name}" resmi dibuat di LeluhurQu.`,
+        descText !== 'Keluarga Besar Silsilah Trah' ? `Catatan: ${descText}` : '',
+        initialMembers.length > 0
+          ? `Tercatat ${initialMembers.length} anggota awal (${initialMembers[0].name}${parsedChildren.length > 0 ? ` + ${parsedChildren.length} keturunan langsung` : ''}).`
+          : 'Silakan lengkapi silsilah anggota melalui Grid atau Tabel Excel.',
+      ].filter(Boolean);
+
+      const introPost: TrahPost = {
+        id: `post_trah_${nowTs}`,
+        trahId: newTrah.id,
+        trahName: newTrah.name,
+        lineageSide: newTrahLineage,
+        authorName: accountProfile.displayName || 'Ian (Anda)',
+        authorKinship: `${accountProfile.kinshipRole ? accountProfile.kinshipRole + ' • ' : ''}Pendiri ${newTrah.name}`,
+        authorAvatar: accountProfile.avatarUrl || undefined,
+        content: introLines.join('\n'),
+        category: 'silaturahmi',
+        likesCount: 1,
+        likedByMe: true,
+        comments: [],
+        timestamp: 'Baru saja',
+      };
+      setTrahPosts((prev) => [introPost, ...prev]);
+    }
+
+    const targetAfterSave = newTrahTargetView;
+    if (targetAfterSave !== 'stay') {
+      setViewMode(targetAfterSave);
+      if (targetAfterSave === 'feed') {
+        setFeedPillarFilter(newTrah.id);
+      }
+    }
+
     setIsAddTrahModalOpen(false);
     setNewTrahName('');
     setNewTrahDesc('');
     setNewTrahLineage('ayah_user');
-    showNotification(`Kategori "${newTrah.name}" berhasil dibuat! Silakan tambah leluhur.`);
+    setNewTrahRootName('');
+    setNewTrahRootGender('L');
+    setNewTrahRootDeceased(false);
+    setNewTrahRootSpouse('');
+    setNewTrahChildrenInput('');
+    setNewTrahCreateIntroPost(true);
+    setNewTrahTargetView('grid');
+
+    showNotification(
+      initialMembers.length > 0
+        ? `Trah "${newTrah.name}" (${initialMembers.length} anggota) tersimpan & tersambung ke Grid, Excel, Medsos & Buku PDF!`
+        : `Trah "${newTrah.name}" tersimpan & tersambung ke semua submenu!`
+    );
   };
 
   const handleSaveSpouseLink = (e: React.FormEvent) => {
@@ -1864,7 +2183,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
 
     setTrahList(updatedList);
     try {
-      localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(updatedList));
+      localStorage.setItem(activeTrahStorageKey, JSON.stringify(updatedList));
     } catch (err) {
       console.warn(err);
     }
@@ -1882,7 +2201,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     }
 
     const currentLineage = activeTrah.lineageSide || 'ayah_user';
-    let authorKinship = 'Keluarga';
+    let authorKinship = `Keluarga ${activeTrah.name}`;
     if (currentLineage === 'ayah_user') authorKinship = 'Keluarga Trah Ayah';
     else if (currentLineage === 'ibu_user') authorKinship = 'Keluarga Trah Ibu';
     else if (currentLineage === 'ayah_pasangan') authorKinship = 'Keluarga Besan Ayah';
@@ -1891,6 +2210,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     const newPost: TrahPost = {
       id: `post_${Date.now()}`,
       trahId: activeTrah.id,
+      trahName: activeTrah.name,
       lineageSide: currentLineage,
       authorName: accountProfile.displayName || 'Ian (Anda)',
       authorKinship: `${accountProfile.kinshipRole ? accountProfile.kinshipRole + ' • ' : ''}${authorKinship}`,
@@ -1965,11 +2285,11 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     setTrahList(updatedTrahList);
     setActiveTrahId('trah-ayah-user');
     try {
-      localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(updatedTrahList));
+      localStorage.setItem(activeTrahStorageKey, JSON.stringify(updatedTrahList));
     } catch (err) {
       console.warn('Storage sync err:', err);
     }
-    showNotification('Contoh Trah Santa berhasil dimuat ke Pilar Trah Ayah! 👨✨');
+    showNotification('Contoh 4 Pilar Trah (Trah Santa) berhasil dimuat! 👨✨');
   };
 
   const handleMoveActiveTrahToAyah = () => {
@@ -1991,7 +2311,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     });
     setTrahList(updated);
     try {
-      localStorage.setItem(ACTIVE_STORAGE_KEY, JSON.stringify(updated));
+      localStorage.setItem(activeTrahStorageKey, JSON.stringify(updated));
     } catch (err) {
       console.warn(err);
     }
@@ -2005,18 +2325,30 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     setTrahList((prev) =>
       prev.map((t) => (t.id === trahId ? { ...t, ...updates } : t))
     );
+    if (updates.name || updates.lineageSide) {
+      setTrahPosts((prev) =>
+        prev.map((p) =>
+          p.trahId === trahId
+            ? {
+                ...p,
+                trahName: updates.name ?? p.trahName,
+                lineageSide: updates.lineageSide ?? p.lineageSide,
+              }
+            : p
+        )
+      );
+    }
   };
 
   const handleDeleteTrah = (trahId: string) => {
-    if (trahList.length <= 1) {
-      showNotification('Minimal harus tersisa 1 Trah keluarga.');
-      return;
-    }
     const target = trahList.find((t) => t.id === trahId);
     const remaining = trahList.filter((t) => t.id !== trahId);
     setTrahList(remaining);
-    if (activeTrahId === trahId && remaining[0]) {
-      setActiveTrahId(remaining[0].id);
+    if (activeTrahId === trahId) {
+      setActiveTrahId(remaining[0]?.id || '');
+    }
+    if (feedPillarFilter === trahId) {
+      setFeedPillarFilter('all');
     }
     showNotification(`Trah "${target?.name || ''}" berhasil dihapus.`);
   };
@@ -2347,11 +2679,15 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
             <h2 className="text-xs font-black text-white truncate leading-tight">
               {viewMode === 'grid' && 'Grid Manual / Auto'}
               {viewMode === 'excel' && 'Tabel Data (Excel)'}
-              {viewMode === 'feed' && 'Medsos 4 Trah'}
+              {viewMode === 'feed' && `Medsos TrahBook (${trahList.length} Trah)`}
               {viewMode === 'settings' && 'Pengaturan & Akun'}
             </h2>
             <span className="text-[10px] text-emerald-200 font-bold truncate leading-none mt-0.5">
-              {viewMode === 'settings' ? accountProfile.displayName : activeTrah.name}
+              {viewMode === 'settings'
+                ? accountProfile.displayName
+                : trahList.length === 0
+                ? 'Belum Ada Trah (0)'
+                : activeTrah.name}
             </span>
           </div>
         </div>
@@ -2400,7 +2736,9 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
               roleTag = 'Ibu Besan';
               label = t.name.split('(')[0].trim() || 'Trah Ibu Pasangan';
             } else {
-              roleTag = 'Umum';
+              badgeIcon = '🌳';
+              roleTag = 'Modular';
+              label = t.name;
             }
 
             return (
@@ -2426,8 +2764,17 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
           })}
 
           <button
+            onClick={() => setIsAddTrahModalOpen(true)}
+            className="py-1 px-2.5 rounded-xl bg-amber-400/90 hover:bg-amber-300 text-stone-950 text-[11px] font-extrabold flex items-center gap-1 shrink-0 shadow-2xs"
+            title="Buat Trah Modular Baru & Sinkronkan ke Semua Submenu"
+          >
+            <FolderPlus className="w-3 h-3" />
+            <span>Trah Baru</span>
+          </button>
+
+          <button
             onClick={() => setIsSpouseModalOpen(true)}
-            className="py-1 px-2 rounded-xl bg-emerald-800/80 hover:bg-emerald-700 text-white text-[11px] font-bold flex items-center gap-1 border border-emerald-700"
+            className="py-1 px-2 rounded-xl bg-emerald-800/80 hover:bg-emerald-700 text-white text-[11px] font-bold flex items-center gap-1 border border-emerald-700 shrink-0"
             title="Kelola Pasangan & Hubungkan 4 Trah"
           >
             <Plus className="w-3 h-3 text-amber-300" />
@@ -2457,7 +2804,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
           {viewMode === 'feed' && (
             <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-blue-50 border border-blue-200 text-blue-800 text-[11px] font-extrabold">
               <MessageSquareText className="w-3.5 h-3.5 text-blue-600" />
-              <span>Medsos Khusus 4 Trah</span>
+              <span>Medsos TrahBook ({trahList.length} Trah)</span>
             </div>
           )}
           {viewMode === 'settings' && (
@@ -2468,7 +2815,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
           )}
         </div>
 
-        {(viewMode === 'grid' || viewMode === 'excel') && (
+        {(viewMode === 'grid' || viewMode === 'excel') && trahList.length > 0 && (
           <button
             type="button"
             onClick={() => setIsBookModalOpen(true)}
@@ -2486,7 +2833,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       {/* ========================================================= */}
       <main
         className={`flex-1 relative ${
-          viewMode === 'grid'
+          viewMode === 'grid' && trahList.length > 0
             ? 'p-2 flex flex-col overflow-hidden'
             : 'p-4 overflow-y-auto overflow-x-auto block touch-pan-y'
         }`}
@@ -2496,7 +2843,68 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
           backgroundSize: '24px 24px'
         }}
       >
-        {activeTrah.members.length === 0 && viewMode !== 'grid' && viewMode !== 'settings' ? (
+        {trahList.length === 0 && viewMode !== 'settings' ? (
+          <div className="max-w-lg mx-auto my-6 bg-white rounded-3xl border border-stone-200 shadow-lg p-5 sm:p-6 space-y-5 text-center select-text">
+            <div className="w-14 h-14 rounded-2xl bg-emerald-100 text-emerald-700 flex items-center justify-center mx-auto shadow-2xs">
+              <Users className="w-7 h-7" />
+            </div>
+
+            <div className="space-y-1.5">
+              <h3 className="text-base sm:text-lg font-black text-stone-900">
+                Belum Ada Trah Keluarga di Akun Ini
+              </h3>
+              <p className="text-xs text-stone-600 leading-relaxed">
+                Demi privasi, akun baru hanya menampilkan <strong>Trah dari undangan keluarga</strong> atau <strong>Trah baru yang Anda buat sendiri</strong> — contoh 4 Trah milik akun lain tidak ditampilkan otomatis.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 text-left">
+              <button
+                type="button"
+                onClick={() => setIsAddTrahModalOpen(true)}
+                className="w-full py-3.5 px-4 rounded-2xl bg-gradient-to-r from-emerald-700 to-teal-700 hover:from-emerald-800 hover:to-teal-800 text-white font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-md active:scale-98 transition"
+              >
+                <FolderPlus className="w-4 h-4 text-amber-300" />
+                <span>Buat Trah Keluarga Baru</span>
+              </button>
+
+              <div className="p-3.5 rounded-2xl bg-stone-50 border border-stone-200 space-y-2">
+                <label className="text-[11px] font-extrabold text-stone-800 flex items-center gap-1.5">
+                  <Link2 className="w-3.5 h-3.5 text-emerald-700" />
+                  <span>Punya Link / Kode Undangan dari Saudara?</span>
+                </label>
+                <div className="flex gap-1.5">
+                  <input
+                    type="text"
+                    value={inviteJoinInput}
+                    onChange={(e) => setInviteJoinInput(e.target.value)}
+                    placeholder="Tempel link (?trahInvite=...) atau kode LQH1:..."
+                    className="flex-1 min-w-0 px-3 py-2 text-xs bg-white border border-stone-300 rounded-xl focus:border-emerald-600 outline-hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleAcceptTrahInvite(inviteJoinInput)}
+                    className="px-3.5 py-2 rounded-xl bg-amber-400 hover:bg-amber-500 text-stone-950 font-extrabold text-xs shrink-0 transition"
+                  >
+                    Gabung
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {accountScope.isOwner && (
+              <div className="pt-2 border-t border-stone-100">
+                <button
+                  type="button"
+                  onClick={handleResetExampleSanta}
+                  className="text-[11px] font-bold text-emerald-700 hover:text-emerald-900 underline"
+                >
+                  Muat kembali 4 Pilar Trah pemilik (Trah Santa &amp; Rohani)
+                </button>
+              </div>
+            )}
+          </div>
+        ) : activeTrah.members.length === 0 && viewMode !== 'grid' && viewMode !== 'settings' ? (
           <div className="flex flex-col items-center justify-center text-center p-6 bg-white rounded-3xl border border-dashed border-stone-300 max-w-md mx-auto my-auto shadow-sm">
             <Users className="w-10 h-10 text-emerald-600 mb-2" />
             <h3 className="font-bold text-sm text-stone-800">Silsilah Masih Kosong</h3>
@@ -2890,31 +3298,42 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                 <div>
                   <div className="flex items-center gap-2">
                     <h3 className="font-extrabold text-sm sm:text-base text-white leading-tight">
-                      Medsos 4 Trah (TrahBook)
+                      Medsos TrahBook ({trahList.length} Trah)
                     </h3>
                     <span className="text-[10px] font-bold bg-amber-400 text-stone-950 px-2 py-0.5 rounded-full">
-                      Keluarga Besar
+                      Modular Keluarga
                     </span>
                   </div>
                   <p className="text-[11px] text-blue-200 mt-0.5">
-                    Ruang silaturahmi, kabar gembira, foto kenangan & lelayu untuk 4 pilar trah
+                    Ruang silaturahmi, kabar gembira, foto kenangan & lelayu terhubung ke semua Trah
                   </p>
                 </div>
               </div>
 
-              <button
-                onClick={() => {
-                  setInviteTrahTarget(activeTrah);
-                  setIsInviteModalOpen(true);
-                }}
-                className="py-1.5 px-3 rounded-xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center gap-1.5 backdrop-blur-xs transition"
-              >
-                <Share2 className="w-3.5 h-3.5" />
-                <span>Undang Saudara</span>
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setIsAddTrahModalOpen(true)}
+                  className="py-1.5 px-3 rounded-xl bg-amber-400 hover:bg-amber-300 text-stone-950 font-extrabold text-xs flex items-center gap-1 shadow-xs transition"
+                >
+                  <FolderPlus className="w-3.5 h-3.5" />
+                  <span>+ Trah</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInviteTrahTarget(activeTrah);
+                    setIsInviteModalOpen(true);
+                  }}
+                  className="py-1.5 px-3 rounded-xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center gap-1.5 backdrop-blur-xs transition"
+                >
+                  <Share2 className="w-3.5 h-3.5" />
+                  <span>Undang Saudara</span>
+                </button>
+              </div>
             </div>
 
-            {/* Filter Tab Berdasarkan Pilar Trah */}
+            {/* Filter Tab Dinamis Berdasarkan Semua Trah Modular */}
             <div className="bg-white p-2 rounded-2xl border border-stone-200 shadow-xs flex items-center gap-1.5 overflow-x-auto no-scrollbar text-xs">
               <button
                 onClick={() => setFeedPillarFilter('all')}
@@ -2925,64 +3344,49 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                 }`}
               >
                 <Globe className="w-3.5 h-3.5" />
-                <span>Semua 4 Trah ({trahPosts.length})</span>
+                <span>Semua Trah ({trahPosts.length})</span>
               </button>
 
-              <button
-                onClick={() => setFeedPillarFilter('ayah_user')}
-                className={`py-1.5 px-3 rounded-xl font-bold flex items-center gap-1 shrink-0 transition ${
-                  feedPillarFilter === 'ayah_user'
-                    ? 'bg-sky-600 text-white shadow-xs'
-                    : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
-                }`}
-              >
-                <span>👨 Trah Ayah</span>
-                <span className="text-[10px] opacity-80">
-                  ({trahPosts.filter((p) => p.lineageSide === 'ayah_user').length})
-                </span>
-              </button>
+              {trahList.map((t) => {
+                const isSelected = feedPillarFilter === t.id;
+                let emoji = '🌳';
+                let activeColor = 'bg-emerald-600 text-white shadow-xs';
+                if (t.lineageSide === 'ayah_user') {
+                  emoji = '👨';
+                  activeColor = 'bg-sky-600 text-white shadow-xs';
+                } else if (t.lineageSide === 'ibu_user') {
+                  emoji = '👩';
+                  activeColor = 'bg-rose-600 text-white shadow-xs';
+                } else if (t.lineageSide === 'ayah_pasangan') {
+                  emoji = '💍👨';
+                  activeColor = 'bg-amber-600 text-white shadow-xs';
+                } else if (t.lineageSide === 'ibu_pasangan') {
+                  emoji = '💍👩';
+                  activeColor = 'bg-purple-600 text-white shadow-xs';
+                }
 
-              <button
-                onClick={() => setFeedPillarFilter('ibu_user')}
-                className={`py-1.5 px-3 rounded-xl font-bold flex items-center gap-1 shrink-0 transition ${
-                  feedPillarFilter === 'ibu_user'
-                    ? 'bg-rose-600 text-white shadow-xs'
-                    : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
-                }`}
-              >
-                <span>👩 Trah Ibu</span>
-                <span className="text-[10px] opacity-80">
-                  ({trahPosts.filter((p) => p.lineageSide === 'ibu_user').length})
-                </span>
-              </button>
+                const countForTrah = trahPosts.filter(
+                  (p) => p.trahId === t.id || (!trahList.some((x) => x.id === p.trahId) && p.lineageSide === t.lineageSide)
+                ).length;
 
-              <button
-                onClick={() => setFeedPillarFilter('ayah_pasangan')}
-                className={`py-1.5 px-3 rounded-xl font-bold flex items-center gap-1 shrink-0 transition ${
-                  feedPillarFilter === 'ayah_pasangan'
-                    ? 'bg-amber-600 text-white shadow-xs'
-                    : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
-                }`}
-              >
-                <span>💍👨 Ayah Pasangan</span>
-                <span className="text-[10px] opacity-80">
-                  ({trahPosts.filter((p) => p.lineageSide === 'ayah_pasangan').length})
-                </span>
-              </button>
-
-              <button
-                onClick={() => setFeedPillarFilter('ibu_pasangan')}
-                className={`py-1.5 px-3 rounded-xl font-bold flex items-center gap-1 shrink-0 transition ${
-                  feedPillarFilter === 'ibu_pasangan'
-                    ? 'bg-purple-600 text-white shadow-xs'
-                    : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
-                }`}
-              >
-                <span>💍👩 Ibu Pasangan</span>
-                <span className="text-[10px] opacity-80">
-                  ({trahPosts.filter((p) => p.lineageSide === 'ibu_pasangan').length})
-                </span>
-              </button>
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => {
+                      setFeedPillarFilter(t.id);
+                      setActiveTrahId(t.id);
+                    }}
+                    className={`py-1.5 px-3 rounded-xl font-bold flex items-center gap-1 shrink-0 transition ${
+                      isSelected ? activeColor : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
+                    }`}
+                  >
+                    <span>{emoji}</span>
+                    <span className="max-w-[140px] truncate">{t.name.split('(')[0].trim()}</span>
+                    <span className="text-[10px] opacity-80">({countForTrah})</span>
+                  </button>
+                );
+              })}
             </div>
 
             {/* Kotak Buat Postingan Baru (Facebook-style Status Box) */}
@@ -2999,11 +3403,26 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                     {(accountProfile.displayName || 'IA').slice(0, 2).toUpperCase()}
                   </div>
                 )}
-                <div className="flex-1">
+                <div className="flex-1 min-w-0">
                   <div className="font-extrabold text-xs text-stone-900">{accountProfile.displayName}</div>
-                  <div className="text-[10px] text-stone-500 flex items-center gap-1">
+                  <div className="text-[10px] text-stone-500 flex items-center gap-1.5 mt-0.5 flex-wrap">
                     <span>Mengeposkan ke:</span>
-                    <strong className="text-blue-700 font-semibold">{activeTrah.name}</strong>
+                    <select
+                      value={activeTrah.id}
+                      onChange={(e) => {
+                        setActiveTrahId(e.target.value);
+                        if (feedPillarFilter !== 'all') {
+                          setFeedPillarFilter(e.target.value);
+                        }
+                      }}
+                      className="bg-blue-50 text-blue-800 border border-blue-200 rounded-lg px-2 py-0.5 text-[10px] font-extrabold outline-hidden max-w-[200px]"
+                    >
+                      {trahList.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name}
+                        </option>
+                      ))}
+                    </select>
                   </div>
                 </div>
               </div>
@@ -3056,15 +3475,42 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
             {/* Daftar Postingan Feed Medsos */}
             <div className="space-y-4">
               {trahPosts
-                .filter((p) => (feedPillarFilter === 'all' ? true : p.lineageSide === feedPillarFilter))
+                .filter((p) => {
+                  if (feedPillarFilter === 'all') return true;
+                  const selectedT = trahList.find((x) => x.id === feedPillarFilter);
+                  if (p.trahId === feedPillarFilter) return true;
+                  if (selectedT && !trahList.some((x) => x.id === p.trahId) && p.lineageSide === selectedT.lineageSide) {
+                    return true;
+                  }
+                  return false;
+                })
                 .map((post) => {
-                  let badgePillar = { label: 'Trah Ayah', bg: 'bg-sky-100 text-sky-800 border-sky-300' };
-                  if (post.lineageSide === 'ibu_user') {
-                    badgePillar = { label: 'Trah Ibu', bg: 'bg-rose-100 text-rose-800 border-rose-300' };
+                  const matchedTrah = trahList.find((t) => t.id === post.trahId);
+                  const displayTrahLabel = post.trahName || matchedTrah?.name;
+                  let badgePillar = {
+                    label: displayTrahLabel || 'Trah Modular',
+                    bg: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+                  };
+                  if (post.lineageSide === 'ayah_user') {
+                    badgePillar = {
+                      label: displayTrahLabel || 'Trah Ayah',
+                      bg: 'bg-sky-100 text-sky-800 border-sky-300',
+                    };
+                  } else if (post.lineageSide === 'ibu_user') {
+                    badgePillar = {
+                      label: displayTrahLabel || 'Trah Ibu',
+                      bg: 'bg-rose-100 text-rose-800 border-rose-300',
+                    };
                   } else if (post.lineageSide === 'ayah_pasangan') {
-                    badgePillar = { label: 'Ayah Pasangan', bg: 'bg-amber-100 text-amber-800 border-amber-300' };
+                    badgePillar = {
+                      label: displayTrahLabel || 'Ayah Pasangan',
+                      bg: 'bg-amber-100 text-amber-800 border-amber-300',
+                    };
                   } else if (post.lineageSide === 'ibu_pasangan') {
-                    badgePillar = { label: 'Ibu Pasangan', bg: 'bg-purple-100 text-purple-800 border-purple-300' };
+                    badgePillar = {
+                      label: displayTrahLabel || 'Ibu Pasangan',
+                      bg: 'bg-purple-100 text-purple-800 border-purple-300',
+                    };
                   }
 
                   let catLabel = '🤝 Silaturahmi';
@@ -3094,7 +3540,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                               <span className="text-[10px] text-stone-400">•</span>
                               <span className="text-[10px] text-stone-500 font-medium">{post.authorKinship}</span>
                             </div>
-                            <div className="flex items-center gap-1.5 mt-0.5">
+                            <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
                               <span className="text-[9px] text-stone-400 font-mono">{post.timestamp}</span>
                               <span className={`text-[8px] font-bold px-1.5 py-0.2 rounded border ${badgePillar.bg}`}>
                                 {badgePillar.label}
@@ -3453,6 +3899,11 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                   <button
                     onClick={() => {
                       setIsSidebarOpen(false);
+                      if (trahList.length === 0) {
+                        setIsAddTrahModalOpen(true);
+                        showNotification('Buat Trah keluarga pertama Anda terlebih dahulu!');
+                        return;
+                      }
                       handleOpenQuickBatch();
                     }}
                     className="w-full py-2 px-3 rounded-xl bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-300 hover:to-amber-400 text-stone-950 font-black text-xs flex items-center justify-between shadow-xs active:scale-95 transition"
@@ -3483,6 +3934,10 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                   <button
                     onClick={() => {
                       setIsSidebarOpen(false);
+                      if (trahList.length === 0) {
+                        showNotification('Buat Trah baru terlebih dahulu sebelum mengundang keluarga.');
+                        return;
+                      }
                       setInviteTrahTarget(activeTrah);
                       setIsInviteModalOpen(true);
                     }}
@@ -3499,6 +3954,10 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                   <button
                     onClick={() => {
                       setIsSidebarOpen(false);
+                      if (trahList.length === 0) {
+                        showNotification('Buat Trah baru terlebih dahulu untuk membuat Buku Leluhur.');
+                        return;
+                      }
                       setIsBookModalOpen(true);
                     }}
                     className="w-full py-2 px-3 rounded-xl bg-emerald-900/90 hover:bg-emerald-800 text-white font-bold text-xs flex items-center justify-between border border-emerald-600/60 shadow-xs active:scale-95 transition"
@@ -3533,26 +3992,47 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                     <Layers className="w-3.5 h-3.5 text-amber-400" />
                     <span>Pilih Trah Aktif</span>
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsSidebarOpen(false);
-                      setViewMode('settings');
-                    }}
-                    className="text-[10px] font-bold text-emerald-300 hover:text-emerald-200"
-                  >
-                    Kelola
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsSidebarOpen(false);
+                        setIsAddTrahModalOpen(true);
+                      }}
+                      className="text-[10px] font-extrabold text-amber-300 hover:text-amber-200"
+                    >
+                      + Baru
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsSidebarOpen(false);
+                        setViewMode('settings');
+                      }}
+                      className="text-[10px] font-bold text-emerald-300 hover:text-emerald-200"
+                    >
+                      Kelola
+                    </button>
+                  </div>
                 </div>
 
                 <div className="space-y-1.5">
+                  {trahList.length === 0 && (
+                    <div className="p-2.5 rounded-xl bg-stone-900/90 border border-stone-700 text-[11px] text-stone-400 text-center">
+                      Belum ada Trah — klik <strong className="text-amber-300">+ Baru</strong> atau tempel undangan keluarga.
+                    </div>
+                  )}
                   {trahList.map((t) => {
                     const isCurrent = t.id === activeTrah.id;
-                    let iconEmoji = '👨';
-                    let badgeLabel = 'Trah Ayah';
-                    let badgeColor = 'bg-sky-950 text-sky-300 border-sky-700';
+                    let iconEmoji = '🌳';
+                    let badgeLabel = 'Trah Modular';
+                    let badgeColor = 'bg-emerald-950 text-emerald-300 border-emerald-700';
 
-                    if (t.lineageSide === 'ibu_user') {
+                    if (t.lineageSide === 'ayah_user') {
+                      iconEmoji = '👨';
+                      badgeLabel = 'Trah Ayah';
+                      badgeColor = 'bg-sky-950 text-sky-300 border-sky-700';
+                    } else if (t.lineageSide === 'ibu_user') {
                       iconEmoji = '👩';
                       badgeLabel = 'Trah Ibu';
                       badgeColor = 'bg-rose-950 text-rose-300 border-rose-700';
@@ -4438,9 +4918,10 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
               </label>
               <div className="grid grid-cols-2 gap-1.5">
                 {trahList.map((t) => {
-                  const isSel = inviteTrahTarget?.id === t.id;
-                  let iconEmoji = '👨';
-                  if (t.lineageSide === 'ibu_user') iconEmoji = '👩';
+                  const isSel = (inviteTrahTarget || activeTrah)?.id === t.id;
+                  let iconEmoji = '🌳';
+                  if (t.lineageSide === 'ayah_user') iconEmoji = '👨';
+                  else if (t.lineageSide === 'ibu_user') iconEmoji = '👩';
                   else if (t.lineageSide === 'ayah_pasangan') iconEmoji = '💍👨';
                   else if (t.lineageSide === 'ibu_pasangan') iconEmoji = '💍👩';
 
@@ -4468,73 +4949,86 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
               </div>
             </div>
 
-            {/* Preview Teks Undangan */}
-            <div className="bg-stone-50 p-3 rounded-2xl border border-stone-200 space-y-1.5">
-              <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">
-                Pratinjau Pesan Undangan Medsos:
-              </span>
-              <div className="bg-white p-3 rounded-xl border border-stone-200 text-xs text-stone-700 leading-relaxed font-sans shadow-2xs whitespace-pre-wrap select-text">
-{`Assalamualaikum Wr. Wb. / Salam Hangat Keluarga Besar,
+            {(() => {
+              const target = inviteTrahTarget || activeTrah;
+              const inviteToken = encodeTrahInviteToken(
+                target,
+                accountProfile.displayName || 'Keluarga'
+              );
+              const inviteLink = `${window.location.origin}${window.location.pathname}?trahInvite=${encodeURIComponent(inviteToken)}`;
+              const inviteText = `Assalamualaikum Wr. Wb. / Salam Hangat Keluarga Besar,\n\nAnda diundang bergabung ke silsilah keluarga:\n🌳 *${target.name}*\n${target.description}\n\nSaat ini telah tercatat ${target.members.length} saudara/anggota trah.\nKlik link undangan khusus Trah ini (atau tempel kode undangan di LeluhurQu):\n👉 ${inviteLink}\n\nKode Undangan:\n${inviteToken}\n\nSalam hangat silaturahmi keluarga!`;
 
-Mari kita bersama-sama menyambung tali silaturahmi & melengkapi silsilah leluhur keluarga kita di:
-🌳 *${(inviteTrahTarget || activeTrah).name}*
-${(inviteTrahTarget || activeTrah).description}
+              return (
+                <>
+                  {/* Preview Teks Undangan */}
+                  <div className="bg-stone-50 p-3 rounded-2xl border border-stone-200 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">
+                        Link &amp; Kode Undangan Khusus Trah:
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(inviteToken);
+                          showNotification('Kode undangan (LQH1) berhasil disalin! 📋');
+                        }}
+                        className="text-[10px] font-extrabold text-emerald-700 hover:text-emerald-900"
+                      >
+                        Salin Kode Saja
+                      </button>
+                    </div>
+                    <div className="bg-white p-3 rounded-xl border border-stone-200 text-xs text-stone-700 leading-relaxed font-sans shadow-2xs whitespace-pre-wrap select-text max-h-40 overflow-y-auto">
+                      {inviteText}
+                    </div>
+                  </div>
 
-Saat ini telah tercatat ${(inviteTrahTarget || activeTrah).members.length} saudara/anggota trah.
-Yuk cek garis nasab, tambahkan foto, serta lengkapi nama anak & cucu melalui aplikasi LeluhurQu:
-👉 ${window.location.href}
+                  {/* Tombol Bagikan ke WhatsApp, ChatQu Warga, dan Salin Teks */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(inviteText)}`, '_blank');
+                        showNotification('Membuka WhatsApp untuk mengirim undangan trah! 💬');
+                      }}
+                      className="py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm active:scale-95 transition"
+                    >
+                      <MessageCircle className="w-4 h-4 fill-white" />
+                      <span>Kirim WhatsApp</span>
+                    </button>
 
-Salam hangat silaturahmi keluarga!`}
-              </div>
-            </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(inviteText);
+                        if (onOpenChatQu) {
+                          setIsInviteModalOpen(false);
+                          onOpenChatQu();
+                          showNotification('Undangan disalin & membuka ChatQu Warga untuk tempel link! 📢');
+                        } else {
+                          showNotification('Undangan disalin. Buka ChatQu melalui menu utama WargaQu');
+                        }
+                      }}
+                      className="py-2.5 px-3 rounded-xl bg-teal-700 hover:bg-teal-800 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm active:scale-95 transition"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      <span>ChatQu Warga</span>
+                    </button>
 
-            {/* Tombol Bagikan ke WhatsApp, ChatQu Warga, dan Salin Teks */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => {
-                  const target = inviteTrahTarget || activeTrah;
-                  const text = `Assalamualaikum Wr. Wb. / Salam Hangat Keluarga Besar,\n\nMari kita bersama-sama menyambung tali silaturahmi & melengkapi silsilah leluhur keluarga kita di:\n🌳 *${target.name}*\n${target.description}\n\nSaat ini telah tercatat ${target.members.length} saudara/anggota trah.\nYuk cek garis nasab, tambahkan foto, serta lengkapi nama anak & cucu melalui aplikasi LeluhurQu:\n👉 ${window.location.href}\n\nSalam hangat silaturahmi keluarga!`;
-                  window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`, '_blank');
-                  showNotification('Membuka WhatsApp untuk mengirim undangan trah! 💬');
-                }}
-                className="py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm active:scale-95 transition"
-              >
-                <MessageCircle className="w-4 h-4 fill-white" />
-                <span>Kirim WhatsApp</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  if (onOpenChatQu) {
-                    setIsInviteModalOpen(false);
-                    onOpenChatQu();
-                    showNotification('Membuka ChatQu Warga untuk koordinasi silsilah! 📢');
-                  } else {
-                    showNotification('Fitur ChatQu dapat dibuka melalui menu utama WargaQu');
-                  }
-                }}
-                className="py-2.5 px-3 rounded-xl bg-teal-700 hover:bg-teal-800 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm active:scale-95 transition"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>ChatQu Warga</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  const target = inviteTrahTarget || activeTrah;
-                  const text = `Assalamualaikum Wr. Wb. / Salam Hangat Keluarga Besar,\n\nMari kita bersama-sama menyambung tali silaturahmi & melengkapi silsilah leluhur keluarga kita di:\n🌳 *${target.name}*\n${target.description}\n\nSaat ini telah tercatat ${target.members.length} saudara/anggota trah.\nYuk cek garis nasab, tambahkan foto, serta lengkapi nama anak & cucu melalui aplikasi LeluhurQu:\n👉 ${window.location.href}\n\nSalam hangat silaturahmi keluarga!`;
-                  navigator.clipboard.writeText(text);
-                  showNotification('Teks undangan berhasil disalin ke clipboard! 📋');
-                }}
-                className="py-2.5 px-3 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-800 font-extrabold text-xs flex items-center justify-center gap-1.5 active:scale-95 transition border border-stone-300"
-              >
-                <Copy className="w-3.5 h-3.5" />
-                <span>Salin Pesan</span>
-              </button>
-            </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(inviteText);
+                        showNotification('Link & kode undangan berhasil disalin ke clipboard! 📋');
+                      }}
+                      className="py-2.5 px-3 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-800 font-extrabold text-xs flex items-center justify-center gap-1.5 active:scale-95 transition border border-stone-300"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Salin Pesan</span>
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
           </div>
         </div>
       )}
@@ -4646,13 +5140,13 @@ Salam hangat silaturahmi keluarga!`}
       )}
 
       {/* ========================================================= */}
-      {/* 10. MODAL TAMBAH KATEGORI TRAH BARU */}
+      {/* 10. MODAL TAMBAH TRAH MODULAR (TERINTEGRASI LINTAS SUBMENU) */}
       {/* ========================================================= */}
       {isAddTrahModalOpen && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
           <form
             onSubmit={handleSaveTrah}
-            className="bg-white rounded-3xl max-w-sm w-full p-5 space-y-3.5 shadow-2xl border border-stone-200 relative text-stone-800"
+            className="bg-white rounded-3xl max-w-md w-full p-5 space-y-3.5 shadow-2xl border border-stone-200 relative text-stone-800 max-h-[92vh] overflow-y-auto"
           >
             <button
               type="button"
@@ -4662,36 +5156,45 @@ Salam hangat silaturahmi keluarga!`}
               <X className="w-4 h-4" />
             </button>
 
-            <div>
-              <h3 className="font-bold text-sm text-stone-900">Tambah Pilar / Kategori Trah</h3>
-              <p className="text-[10px] text-stone-500">Buat pohon silsilah baru (Trah Ayah, Trah Ibu, dll)</p>
+            <div className="flex items-center gap-2.5 pr-7">
+              <div className="w-9 h-9 rounded-2xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                <FolderPlus className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-extrabold text-sm text-stone-900">Buat Trah Modular Baru</h3>
+                <p className="text-[10px] text-stone-500">
+                  Isi sekali — otomatis terhubung ke Kanvas Grid, Tabel Excel, Medsos TrahBook &amp; Buku PDF
+                </p>
+              </div>
             </div>
 
-            <div>
-              <label className="text-[11px] font-bold text-stone-700 block mb-1">Nama Trah *</label>
-              <input
-                type="text"
-                required
-                value={newTrahName}
-                onChange={(e) => setNewTrahName(e.target.value)}
-                placeholder="Contoh: TRAH KASAN (IBU)"
-                className="w-full px-3 py-2 text-xs bg-stone-50 border border-stone-200 rounded-xl focus:border-emerald-500 focus:bg-white outline-hidden font-bold"
-              />
-            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div>
+                <label className="text-[11px] font-bold text-stone-700 block mb-1">Nama Trah *</label>
+                <input
+                  type="text"
+                  required
+                  value={newTrahName}
+                  onChange={(e) => setNewTrahName(e.target.value)}
+                  placeholder="Contoh: TRAH KASAN (IBU)"
+                  className="w-full px-3 py-2 text-xs bg-stone-50 border border-stone-200 rounded-xl focus:border-emerald-500 focus:bg-white outline-hidden font-bold"
+                />
+              </div>
 
-            <div>
-              <label className="text-[11px] font-bold text-stone-700 block mb-1">Kategori Garis Pilar</label>
-              <select
-                value={newTrahLineage}
-                onChange={(e) => setNewTrahLineage(e.target.value as LineageSide)}
-                className="w-full px-2.5 py-2 text-xs bg-stone-50 border border-stone-200 rounded-xl focus:border-emerald-500 font-bold outline-hidden"
-              >
-                <option value="ayah_user">👨 Trah Ayah (User)</option>
-                <option value="ibu_user">👩 Trah Ibu (User)</option>
-                <option value="ayah_pasangan">💍👨 Trah Ayah Pasangan</option>
-                <option value="ibu_pasangan">💍👩 Trah Ibu Pasangan</option>
-                <option value="umum">🌳 Trah Keluarga Umum</option>
-              </select>
+              <div>
+                <label className="text-[11px] font-bold text-stone-700 block mb-1">Kategori Garis Pilar</label>
+                <select
+                  value={newTrahLineage}
+                  onChange={(e) => setNewTrahLineage(e.target.value as LineageSide)}
+                  className="w-full px-2.5 py-2 text-xs bg-stone-50 border border-stone-200 rounded-xl focus:border-emerald-500 font-bold outline-hidden"
+                >
+                  <option value="ayah_user">👨 Trah Ayah (User)</option>
+                  <option value="ibu_user">👩 Trah Ibu (User)</option>
+                  <option value="ayah_pasangan">💍👨 Trah Ayah Pasangan</option>
+                  <option value="ibu_pasangan">💍👩 Trah Ibu Pasangan</option>
+                  <option value="umum">🌳 Trah Modular / Umum</option>
+                </select>
+              </div>
             </div>
 
             <div>
@@ -4705,17 +5208,156 @@ Salam hangat silaturahmi keluarga!`}
               />
             </div>
 
+            {/* Isi Cepat Silsilah Awal (Opsional) */}
+            <div className="p-3 bg-emerald-50/70 rounded-2xl border border-emerald-200 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-extrabold text-emerald-900 flex items-center gap-1">
+                  <Zap className="w-3.5 h-3.5 text-amber-500 fill-amber-500" />
+                  <span>Isi Cepat Silsilah Awal (Opsional)</span>
+                </span>
+                <span className="text-[9px] font-bold text-emerald-700 bg-white px-2 py-0.5 rounded-full border border-emerald-200">
+                  Sync Grid &amp; Excel
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <div className="sm:col-span-2">
+                  <label className="text-[10px] font-bold text-stone-600 block mb-0.5">
+                    Leluhur Utama / Uyut (Gen 0)
+                  </label>
+                  <input
+                    type="text"
+                    value={newTrahRootName}
+                    onChange={(e) => setNewTrahRootName(e.target.value)}
+                    placeholder="Contoh: Buyut Kasan"
+                    className="w-full px-2.5 py-1.5 text-xs bg-white border border-emerald-200 rounded-xl focus:border-emerald-500 outline-hidden font-semibold"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] font-bold text-stone-600 block mb-0.5">Gender</label>
+                  <div className="grid grid-cols-2 gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setNewTrahRootGender('L')}
+                      className={`py-1.5 rounded-xl text-[11px] font-bold border ${
+                        newTrahRootGender === 'L'
+                          ? 'bg-sky-600 text-white border-sky-600'
+                          : 'bg-white text-stone-600 border-stone-200'
+                      }`}
+                    >
+                      L
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewTrahRootGender('P')}
+                      className={`py-1.5 rounded-xl text-[11px] font-bold border ${
+                        newTrahRootGender === 'P'
+                          ? 'bg-rose-600 text-white border-rose-600'
+                          : 'bg-white text-stone-600 border-stone-200'
+                      }`}
+                    >
+                      P
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 items-center">
+                <div>
+                  <label className="text-[10px] font-bold text-stone-600 block mb-0.5">
+                    Pasangan Leluhur Utama
+                  </label>
+                  <input
+                    type="text"
+                    value={newTrahRootSpouse}
+                    onChange={(e) => setNewTrahRootSpouse(e.target.value)}
+                    placeholder="Contoh: Nyai Siti"
+                    className="w-full px-2.5 py-1.5 text-xs bg-white border border-emerald-200 rounded-xl focus:border-emerald-500 outline-hidden"
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-[11px] font-semibold text-stone-700 pt-3 sm:pt-4 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={newTrahRootDeceased}
+                    onChange={(e) => setNewTrahRootDeceased(e.target.checked)}
+                    className="rounded border-stone-300 text-emerald-700"
+                  />
+                  <span>Sudah Almarhum / Wafat</span>
+                </label>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-0.5">
+                  <label className="text-[10px] font-bold text-stone-600">
+                    Daftar Anak / Gen 1 (pisahkan koma, pakai (P)/(L))
+                  </label>
+                  {newTrahChildrenInput.trim() && (
+                    <span className="text-[9px] font-bold text-emerald-700">
+                      {parseCommaChildren(newTrahChildrenInput).length} anak terdeteksi
+                    </span>
+                  )}
+                </div>
+                <input
+                  type="text"
+                  value={newTrahChildrenInput}
+                  onChange={(e) => setNewTrahChildrenInput(e.target.value)}
+                  placeholder="Contoh: Sari (P), Budi (L), Rohani (P)"
+                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-emerald-200 rounded-xl focus:border-emerald-500 outline-hidden"
+                />
+              </div>
+            </div>
+
+            {/* Integrasi Submenu Tujuan */}
+            <div className="p-3 bg-stone-50 rounded-2xl border border-stone-200 space-y-2">
+              <label className="flex items-center gap-2 text-[11px] font-bold text-stone-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={newTrahCreateIntroPost}
+                  onChange={(e) => setNewTrahCreateIntroPost(e.target.checked)}
+                  className="rounded border-stone-300 text-blue-600"
+                />
+                <span>Otomatis buat pengumuman pembuka di Medsos TrahBook</span>
+              </label>
+
+              <div>
+                <label className="text-[10px] font-bold text-stone-500 block mb-1">
+                  Setelah simpan, langsung buka submenu:
+                </label>
+                <div className="grid grid-cols-4 gap-1 text-[10px] font-bold">
+                  {[
+                    { id: 'grid', label: '🎨 Grid' },
+                    { id: 'excel', label: '📑 Excel' },
+                    { id: 'feed', label: '💬 Medsos' },
+                    { id: 'stay', label: 'Tetap' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setNewTrahTargetView(opt.id as 'stay' | 'grid' | 'excel' | 'feed')}
+                      className={`py-1.5 px-1 rounded-xl border transition ${
+                        newTrahTargetView === opt.id
+                          ? 'bg-emerald-700 text-white border-emerald-700 shadow-2xs'
+                          : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             <div className="flex gap-2 pt-2 border-t border-stone-200">
               <button
                 type="submit"
-                className="flex-1 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-bold text-xs shadow-md transition active:scale-98"
+                className="flex-1 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-extrabold text-xs shadow-md transition active:scale-98"
               >
-                Simpan Trah
+                Simpan &amp; Sinkron Semua Submenu
               </button>
               <button
                 type="button"
                 onClick={() => setIsAddTrahModalOpen(false)}
-                className="py-2 px-4 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 font-semibold text-xs transition"
+                className="py-2.5 px-4 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 font-semibold text-xs transition"
               >
                 Batal
               </button>

@@ -538,6 +538,16 @@ export const LeluhurSettingsView: React.FC<LeluhurSettingsViewProps> = ({
           </div>
 
           <div className="space-y-2.5">
+            {trahList.length === 0 && (
+              <div className="p-5 rounded-2xl border border-dashed border-stone-300 bg-stone-50 text-center space-y-2">
+                <p className="text-xs font-bold text-stone-700">
+                  Belum ada Trah di akun ini.
+                </p>
+                <p className="text-[11px] text-stone-500">
+                  Akun baru tidak menampilkan Trah contoh secara otomatis. Klik Tambah Trah atau buka lewat undangan keluarga.
+                </p>
+              </div>
+            )}
             {trahList.map((t) => {
               const isActive = t.id === activeTrahId;
               const isEditing = editingTrahId === t.id;
@@ -658,7 +668,7 @@ export const LeluhurSettingsView: React.FC<LeluhurSettingsViewProps> = ({
                           <span>Ubah</span>
                         </button>
 
-                        {trahList.length > 1 && !isConfirmDelete && (
+                        {!isConfirmDelete && (
                           <button
                             type="button"
                             onClick={() => setConfirmDeleteTrahId(t.id)}

@@ -907,6 +907,8 @@ export const InteractiveGridCanvasView: React.FC<
 
   const boardRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const loadedTrahIdRef = useRef<string>('');
+  const lastMemberSigRef = useRef<string>('');
 
   // Pinch-to-Zoom 2 Jari & Pan Hand Ref
   const pinchRef = useRef<{
@@ -966,6 +968,14 @@ export const InteractiveGridCanvasView: React.FC<
   const designsStorageKey = `${DESIGNS_STORAGE_PREFIX}${activeTrah.id}`;
   const activeDesignIdKey = `${ACTIVE_DESIGN_ID_PREFIX}${activeTrah.id}`;
 
+  const getMemberSig = (members: FamilyMember[]) =>
+    members
+      .map(
+        (m) =>
+          `${m.id}:${m.name}:${m.callName || ''}:${m.birthYear || ''}:${m.deathYear || ''}:${m.isDeceased ? 1 : 0}:${m.photoUrl || ''}:${m.parentId || ''}:${m.generationLevel}:${(m.spouses || []).map((s) => s.name).join('|')}`
+      )
+      .join(';');
+
   // Muat daftar desain tersimpan saat berganti Trah
   useEffect(() => {
     let loadedDesigns: SavedGridDesign[] = [];
@@ -982,9 +992,49 @@ export const InteractiveGridCanvasView: React.FC<
     }
 
     if (loadedDesigns.length > 0) {
-      const target =
+      let target =
         loadedDesigns.find((d) => d.id === storedActiveId) || loadedDesigns[0];
-      setSavedDesigns(loadedDesigns);
+      let nextDesigns = loadedDesigns;
+
+      // Jika desain masih kosong padahal Trah sudah punya anggota (mis. baru diisi di Excel/Buat Trah), auto-generate!
+      if (target.nodes.length === 0 && activeTrah.members.length > 0) {
+        const pKey = target.paperSize || 'a3';
+        const pDim = GRID_PAPER_MAP[pKey];
+        const pW = (target.paperOrientation || 'landscape') === 'landscape' ? pDim.pxW : pDim.pxH;
+        const pH = (target.paperOrientation || 'landscape') === 'landscape' ? pDim.pxH : pDim.pxW;
+        const cMode = target.cardDisplayMode || 'full';
+        const phSize = target.photoFrameSize || '3x4';
+        const optScale = computeOptimalCardScale(activeTrah.members, pW, pH, cMode, phSize);
+        const cardDim = getNodeSize(
+          { id: 'tmp', name: 'Anggota Keluarga', sub: '', x: 0, y: 0, photo: '', wafat: false },
+          cMode,
+          phSize,
+          optScale
+        );
+        const rebuilt = generateSmartLayoutFromTable(
+          activeTrah.members,
+          activeTrah.members.length > 16 ? 'hierarchy_grid_fill' : 'subtree_vertical',
+          pW,
+          pH,
+          cardDim
+        );
+        target = {
+          ...target,
+          nodes: rebuilt.nodes,
+          edges: rebuilt.edges,
+          quickText: buildQuickTextFromTrah(activeTrah.members),
+          cardScale: optScale,
+          updatedAt: Date.now(),
+        };
+        nextDesigns = loadedDesigns.map((d) => (d.id === target.id ? target : d));
+        try {
+          localStorage.setItem(designsStorageKey, JSON.stringify(nextDesigns));
+        } catch (err) {
+          console.warn(err);
+        }
+      }
+
+      setSavedDesigns(nextDesigns);
       setActiveDesignId(target.id);
       setDesignNameInput(target.name);
       setNodes(target.nodes);
@@ -1011,6 +1061,8 @@ export const InteractiveGridCanvasView: React.FC<
       setSelectedIds([]);
       setMoveUnlockedIds([]);
       setMoveAnchorId(null);
+      loadedTrahIdRef.current = activeTrah.id;
+      lastMemberSigRef.current = getMemberSig(activeTrah.members);
       return;
     }
 
@@ -1081,6 +1133,8 @@ export const InteractiveGridCanvasView: React.FC<
     setCardBorderColor('');
     setCaptionInfo(defaultCap);
     setSelectedIds([]);
+    loadedTrahIdRef.current = activeTrah.id;
+    lastMemberSigRef.current = getMemberSig(activeTrah.members);
     try {
       localStorage.setItem(designsStorageKey, JSON.stringify([initialDesign]));
       localStorage.setItem(activeDesignIdKey, initialDesign.id);
@@ -1180,6 +1234,150 @@ export const InteractiveGridCanvasView: React.FC<
     cardBorderColor,
     captionInfo,
   ]);
+
+  // Sinkronisasi otomatis perubahan anggota dari Tabel Excel / Isi Cepat / Edit ke Kanvas Grid aktif
+  useEffect(() => {
+    if (!activeDesignId || loadedTrahIdRef.current !== activeTrah.id) return;
+    const nextSig = getMemberSig(activeTrah.members);
+    if (nextSig === lastMemberSigRef.current) return;
+    lastMemberSigRef.current = nextSig;
+
+    const refreshedQuickText = buildQuickTextFromTrah(activeTrah.members);
+
+    if (nodes.length === 0 && activeTrah.members.length > 0) {
+      const optScale = computeOptimalCardScale(
+        activeTrah.members,
+        boardWidth,
+        boardHeight,
+        cardDisplayMode,
+        photoFrameSize
+      );
+      setCardScale(optScale);
+      const sampleDim = getNodeSize(
+        { id: 'tmp', name: 'Anggota Keluarga', sub: '', x: 0, y: 0, photo: '', wafat: false },
+        cardDisplayMode,
+        photoFrameSize,
+        optScale
+      );
+      const rebuilt = generateSmartLayoutFromTable(
+        activeTrah.members,
+        activeTrah.members.length > 16 ? 'hierarchy_grid_fill' : 'subtree_vertical',
+        boardWidth,
+        boardHeight,
+        sampleDim
+      );
+      setNodes(rebuilt.nodes);
+      setEdges(rebuilt.edges);
+      setQuickText(refreshedQuickText);
+      persistCurrentDesign(rebuilt.nodes, rebuilt.edges, refreshedQuickText);
+      return;
+    }
+
+    const memberMap = new Map<string, FamilyMember>(
+      activeTrah.members.map((m) => [m.id, m])
+    );
+
+    // 1. Perbarui metadata node yang sudah terhubung & buang node member yang telah dihapus di Excel
+    let updatedNodes: InteractiveNode[] = nodes
+      .filter((n) => !n.memberId || memberMap.has(n.memberId))
+      .map((n) => {
+        if (!n.memberId) return n;
+        const m = memberMap.get(n.memberId);
+        if (!m) return n;
+        const subText =
+          m.callName ||
+          (m.birthYear ? `Lahir ${m.birthYear}` : `Gen ${m.generationLevel}`);
+        return {
+          ...n,
+          name: m.name,
+          sub: subText,
+          photo: m.photoUrl || n.photo,
+          wafat: m.isDeceased,
+          genLevel: m.generationLevel,
+        };
+      });
+
+    const survivingIds = new Set(updatedNodes.map((n) => n.id));
+    const updatedEdges: InteractiveEdge[] = edges.filter(
+      (e) => survivingIds.has(e.from) && survivingIds.has(e.to)
+    );
+
+    // 2. Tambahkan member baru yang belum ada di Kanvas Grid
+    const presentMemberIds = new Set(
+      updatedNodes.map((n) => n.memberId).filter((id): id is string => Boolean(id))
+    );
+    const missingMembers = activeTrah.members.filter(
+      (m) => !presentMemberIds.has(m.id)
+    );
+
+    if (missingMembers.length > 0) {
+      const sampleDim = getNodeSize(
+        { id: 'tmp', name: 'Anggota Keluarga', sub: '', x: 0, y: 0, photo: '', wafat: false },
+        cardDisplayMode,
+        photoFrameSize,
+        cardScale
+      );
+      const siblingOffsetByParent = new Map<string, number>();
+
+      missingMembers.forEach((m, idx) => {
+        const parentNode = m.parentId
+          ? updatedNodes.find((n) => n.memberId === m.parentId || n.id === m.parentId)
+          : undefined;
+        const pKey = m.parentId || '__root__';
+        const sibIdx = siblingOffsetByParent.get(pKey) ?? 0;
+        siblingOffsetByParent.set(pKey, sibIdx + 1);
+
+        const baseX = parentNode
+          ? Math.max(40, Math.min(boardWidth - sampleDim.w - 40, parentNode.x + sibIdx * (sampleDim.w + 26)))
+          : 80 + idx * (sampleDim.w + 30);
+        const baseY = parentNode
+          ? Math.min(boardHeight - sampleDim.h - 80, parentNode.y + sampleDim.h + 64)
+          : 90 + m.generationLevel * (sampleDim.h + 64);
+
+        const nodeId = `node_${m.id}`;
+        const newNode: InteractiveNode = {
+          id: nodeId,
+          memberId: m.id,
+          name: m.name,
+          sub:
+            m.callName ||
+            (m.birthYear ? `Lahir ${m.birthYear}` : `Gen ${m.generationLevel}`),
+          x: Math.round(baseX / SNAP_SIZE) * SNAP_SIZE,
+          y: Math.round(baseY / SNAP_SIZE) * SNAP_SIZE,
+          photo: m.photoUrl || '',
+          wafat: m.isDeceased,
+          genLevel: m.generationLevel,
+        };
+        updatedNodes.push(newNode);
+
+        if (parentNode) {
+          updatedEdges.push({ from: parentNode.id, to: nodeId, type: 'child' });
+        }
+
+        if (m.spouses && m.spouses.length > 0) {
+          m.spouses.forEach((sp, spIdx) => {
+            const spNodeId = `node_${m.id}_sp_${spIdx}`;
+            updatedNodes.push({
+              id: spNodeId,
+              name: sp.name,
+              sub: 'Pasangan',
+              x: Math.round((newNode.x + (spIdx + 1) * (sampleDim.w + 18)) / SNAP_SIZE) * SNAP_SIZE,
+              y: newNode.y,
+              photo: '',
+              wafat: sp.status === 'cerai_mati',
+              genLevel: m.generationLevel,
+            });
+            updatedEdges.push({ from: nodeId, to: spNodeId, type: 'couple' });
+          });
+        }
+      });
+    }
+
+    setNodes(updatedNodes);
+    setEdges(updatedEdges);
+    setQuickText(refreshedQuickText);
+    persistCurrentDesign(updatedNodes, updatedEdges, refreshedQuickText);
+  }, [activeTrah.id, activeTrah.members, activeDesignId]);
 
   // Auto-Fit kanvas ke viewport layar (menyesuaikan lebar & tinggi agar kertas Potret/Lanskap utuh)
   const handleFitScreen = useCallback(() => {

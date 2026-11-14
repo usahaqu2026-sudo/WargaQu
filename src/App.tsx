@@ -62,6 +62,18 @@ export default function App() {
 
   // Initial Data Load & Hidden Device ID Init
   useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const trahInvite = params.get('trahInvite');
+      if (trahInvite && trahInvite.trim()) {
+        localStorage.setItem('wargaqu_pending_trah_invite_v1', trahInvite.trim());
+        setCurrentScreen('leluhurqu');
+        window.history.replaceState({ screen: 'leluhurqu' }, '', `${window.location.pathname}#leluhurqu`);
+      }
+    } catch {
+      // ignore URL/storage errors
+    }
+
     AuthService.getHiddenDeviceId(); // ensure persistent hidden device token exists
     const currentAcc = AuthService.getAccount();
     if (currentAcc) {
