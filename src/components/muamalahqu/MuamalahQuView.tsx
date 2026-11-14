@@ -30,6 +30,7 @@ import { MenuItem } from '../../types';
 import { StorageService } from '../../services/storage';
 import { AUTH_SYNC_EVENT, AuthService } from '../../services/authService';
 import { MonetizationService } from '../../services/monetizationService';
+import { RealtimeRelayService } from '../../services/realtimeRelayService';
 
 interface MuamalahQuViewProps {
   onBackToMain: () => void;
@@ -496,6 +497,13 @@ export const MuamalahQuView: React.FC<MuamalahQuViewProps> = ({
       moduleId: 'muamalahqu_tx',
       actionLabel: `Checkout MuamalahQu (${selectedCartItems.length} item)`,
       grossAmount: finalTotal,
+    });
+
+    const acc = AuthService.getAccount();
+    RealtimeRelayService.publish(RealtimeRelayService.getRtChannel(), 'order:muamalahqu', {
+      buyerName: acc ? AuthService.getDisplayName(acc) : 'Warga',
+      total: finalTotal,
+      itemCount: selectedCartItems.length,
     });
 
     setShowOrderSuccessModal(true);

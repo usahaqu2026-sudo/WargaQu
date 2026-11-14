@@ -1,4 +1,5 @@
 import { AuthService } from './authService';
+import { RealtimeRelayService } from './realtimeRelayService';
 
 export type DeviceTrustStatus = 'trusted' | 'frozen_lost' | 'retired_broken' | 'pending_recovery';
 
@@ -264,6 +265,42 @@ export const ZeroTrustService = {
       `${maskDeviceFingerprint(deviceId)}${reason ? ` · ${reason}` : ''}`,
       status === 'frozen_lost' ? 'critical' : 'warning'
     );
+    RealtimeRelayService.publish('admin:policy', 'zt:device_freeze', {
+      deviceId,
+      status,
+      reason: reason || '',
+    });
+    emitZeroTrustSync();
+  },
+
+  applyRemoteFreeze(deviceId: string, status: DeviceTrustStatus, reason?: string): void {
+    const currentId = AuthService.getHiddenDeviceId();
+    const list = this.getDevices();
+    const exists = list.some(d => d.deviceId === deviceId);
+    const next = exists
+      ? list.map(d =>
+          d.deviceId === deviceId ? { ...d, status, lastActiveAt: new Date().toISOString() } : d
+        )
+      : deviceId === currentId
+      ? [
+          {
+            deviceId,
+            maskedFingerprint: maskDeviceFingerprint(deviceId),
+            email: AuthService.getAccount()?.email || 'warga@wargaqu.id',
+            phone: AuthService.getAccount()?.phone || '-',
+            label: 'Perangkat Ini',
+            status,
+            lastActiveAt: new Date().toISOString(),
+            registeredAt: new Date().toISOString(),
+          },
+          ...list,
+        ]
+      : list;
+    saveJson(DEVICES_KEY, next);
+    if (status === 'frozen_lost' && deviceId === currentId) {
+      this.lockAdminSession();
+      this.appendAudit('Zero Trust Relay', 'Perangkat Dibekukan Jarak Jauh', reason || 'HP Hilang', 'critical');
+    }
     emitZeroTrustSync();
   },
 
@@ -294,6 +331,15 @@ export const ZeroTrustService = {
       count = 1;
     }
     saveJson(DEVICES_KEY, next);
+    for (const dev of next) {
+      if (dev.email.toLowerCase() === cleanEmail && dev.status === 'frozen_lost') {
+        RealtimeRelayService.publish('admin:policy', 'zt:device_freeze', {
+          deviceId: dev.deviceId,
+          status: 'frozen_lost',
+          reason: note,
+        });
+      }
+    }
     this.appendAudit(cleanEmail || 'Pemilik Akun', 'Remote Lock HP Hilang', `${count} perangkat dibekukan (${note})`, 'critical');
     emitZeroTrustSync();
     return count;

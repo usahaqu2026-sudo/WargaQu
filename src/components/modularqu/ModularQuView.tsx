@@ -37,6 +37,7 @@ import {
   ModularProfile
 } from '../../types';
 import { AUTH_SYNC_EVENT, AuthService } from '../../services/authService';
+import { MonetizationService } from '../../services/monetizationService';
 
 interface ModularQuViewProps {
   onBackToWarga: () => void;
@@ -574,6 +575,12 @@ export const ModularQuView: React.FC<ModularQuViewProps> = ({
     // Save transaction
     setTransactions((prev) => [newTx, ...prev]);
 
+    const feeEntry = MonetizationService.recordCharge({
+      moduleId: 'usahaqu_pro',
+      actionLabel: `Transaksi ModularQu (${newTx.id})`,
+      grossAmount: total,
+    });
+
     // Clear cart and form
     setCart([]);
     setPosNote('');
@@ -581,7 +588,11 @@ export const ModularQuView: React.FC<ModularQuViewProps> = ({
 
     // Open receipt modal
     bukaStruk(newTx);
-    showNotification('Transaksi Berhasil! Struk siap dicetak.');
+    showNotification(
+      feeEntry
+        ? `Transaksi Berhasil! Biaya modul Rp ${feeEntry.feeAmount.toLocaleString('id-ID')} dicatat.`
+        : 'Transaksi Berhasil! Struk siap dicetak.'
+    );
   };
 
   // Add Manual Expense

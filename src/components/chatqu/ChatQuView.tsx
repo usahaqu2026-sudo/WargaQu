@@ -27,11 +27,19 @@ import {
   Plus
 } from 'lucide-react';
 import { AuthService } from '../../services/authService';
+import {
+  REALTIME_RELAY_EVENT,
+  RelayIncomingEvent,
+  RealtimeRelayService,
+} from '../../services/realtimeRelayService';
+
+type ChatTabType = 'community' | 'chats' | 'announcements' | 'emergency';
 
 interface ChatQuViewProps {
   onBackToMain: () => void;
   showNotification: (msg: string) => void;
   onOpenLogin?: (reason?: string) => void;
+  initialTab?: ChatTabType;
 }
 
 interface MessageItem {
@@ -62,10 +70,14 @@ interface ChatRoomData {
 export const ChatQuView: React.FC<ChatQuViewProps> = ({
   onBackToMain,
   showNotification,
-  onOpenLogin
+  onOpenLogin,
+  initialTab = 'chats'
 }) => {
   // Tabs: 'community' | 'chats' | 'announcements' | 'emergency'
-  const [activeTab, setActiveTab] = useState<'community' | 'chats' | 'announcements' | 'emergency'>('chats');
+  const [activeTab, setActiveTab] = useState<ChatTabType>(initialTab);
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
   const [searchQuery, setSearchQuery] = useState('');
   const [showSearch, setShowSearch] = useState(false);
   const [activeRoom, setActiveRoom] = useState<ChatRoomData | null>(null);
@@ -78,8 +90,16 @@ export const ChatQuView: React.FC<ChatQuViewProps> = ({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Initial chat data
-  const [chats, setChats] = useState<ChatRoomData[]>([
+  // Initial chat data (stored locally on user's phone)
+  const [chats, setChats] = useState<ChatRoomData[]>(() => {
+    try {
+      const saved = localStorage.getItem('wargaqu_chat_rooms_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {}
+    return [
     {
       id: 'emergency-1',
       title: 'DARURAT: Anak Hilang (Blok A)',
@@ -220,7 +240,14 @@ export const ChatQuView: React.FC<ChatQuViewProps> = ({
         }
       ]
     }
-  ]);
+    ];
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('wargaqu_chat_rooms_v1', JSON.stringify(chats));
+    } catch {}
+  }, [chats]);
 
   // Announcements list for Pengumuman tab
   const announcements = [
@@ -266,6 +293,65 @@ export const ChatQuView: React.FC<ChatQuViewProps> = ({
     }
   }, [activeRoom?.messages]);
 
+  // Listen for real-time incoming chat messages over WebSocket pass-through relay
+  useEffect(() => {
+    const handleIncomingChat = (evt: Event) => {
+      const detail = (evt as CustomEvent<RelayIncomingEvent>).detail;
+      if (!detail || detail.eventName !== 'chat:message' || !detail.payload || typeof detail.payload !== 'object') {
+        return;
+      }
+      const p = detail.payload as {
+        roomId?: string;
+        message?: {
+          id?: string;
+          sender?: string;
+          text?: string;
+          time?: string;
+        };
+      };
+      const roomId = p.roomId;
+      const incoming = p.message;
+      if (!roomId || !incoming?.id || !incoming.text) return;
+
+      const remoteMsg: MessageItem = {
+        id: incoming.id,
+        sender: incoming.sender || 'Warga RT',
+        isMe: false,
+        text: incoming.text,
+        time: incoming.time || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        status: 'delivered',
+      };
+
+      setChats(prev =>
+        prev.map(room => {
+          if (room.id !== roomId) return room;
+          if (room.messages.some(m => m.id === remoteMsg.id)) return room;
+          return {
+            ...room,
+            messages: [...room.messages, remoteMsg],
+            lastMessage: `${remoteMsg.sender}: ${remoteMsg.text}`,
+            time: 'Baru saja',
+            unreadCount: activeRoom?.id === roomId ? undefined : (room.unreadCount || 0) + 1,
+          };
+        })
+      );
+
+      setActiveRoom(curr => {
+        if (!curr || curr.id !== roomId) return curr;
+        if (curr.messages.some(m => m.id === remoteMsg.id)) return curr;
+        return {
+          ...curr,
+          messages: [...curr.messages, remoteMsg],
+          lastMessage: `${remoteMsg.sender}: ${remoteMsg.text}`,
+          time: 'Baru saja',
+        };
+      });
+    };
+
+    window.addEventListener(REALTIME_RELAY_EVENT, handleIncomingChat);
+    return () => window.removeEventListener(REALTIME_RELAY_EVENT, handleIncomingChat);
+  }, [activeRoom?.id]);
+
   // Send message handler
   const handleSendMessage = () => {
     if (!inputText.trim() || !activeRoom) return;
@@ -277,19 +363,20 @@ export const ChatQuView: React.FC<ChatQuViewProps> = ({
     }
 
     const senderLabel = acc ? `${AuthService.getDisplayName(acc)} (${acc.phone})` : 'Anda';
+    const trimmedText = inputText.trim();
 
     const newMessage: MessageItem = {
-      id: 'msg-' + Date.now(),
+      id: 'msg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
       sender: senderLabel,
       isMe: true,
-      text: inputText.trim(),
+      text: trimmedText,
       time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       status: 'sent'
     };
 
-    // Update active room
+    // Update active room locally on phone
     const updatedMessages = [...activeRoom.messages, newMessage];
-    const updatedActiveRoom = { ...activeRoom, messages: updatedMessages, lastMessage: inputText.trim(), time: 'Baru saja' };
+    const updatedActiveRoom = { ...activeRoom, messages: updatedMessages, lastMessage: trimmedText, time: 'Baru saja' };
     setActiveRoom(updatedActiveRoom);
 
     // Update global chats list
@@ -299,26 +386,17 @@ export const ChatQuView: React.FC<ChatQuViewProps> = ({
 
     setInputText('');
 
-    // Simulate reply after 1.5 seconds if it's Pak RT
-    if (activeRoom.id === 'pak-rt-ahmad') {
-      setTimeout(() => {
-        const replyMsg: MessageItem = {
-          id: 'reply-' + Date.now(),
-          sender: 'Pak RT Ahmad',
-          isMe: false,
-          text: 'Siap mas, terima kasih konfirmasinya. Salam untuk keluarga ya.',
-          time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          status: 'read'
-        };
-        setActiveRoom(curr => {
-          if (!curr || curr.id !== 'pak-rt-ahmad') return curr;
-          const nextMsgs = [...curr.messages, replyMsg];
-          const nextRoom = { ...curr, messages: nextMsgs, lastMessage: replyMsg.text || '' };
-          setChats(p => p.map(c => (c.id === 'pak-rt-ahmad' ? nextRoom : c)));
-          return nextRoom;
-        });
-      }, 1500);
-    }
+    // Broadcast via stateless WebSocket relay (never stored on server)
+    RealtimeRelayService.publish(RealtimeRelayService.getRtChannel(), 'chat:message', {
+      roomId: activeRoom.id,
+      roomTitle: activeRoom.title,
+      message: {
+        id: newMessage.id,
+        sender: newMessage.sender,
+        text: newMessage.text,
+        time: newMessage.time,
+      },
+    });
   };
 
   const handleOpenRoom = (room: ChatRoomData) => {

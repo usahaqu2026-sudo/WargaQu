@@ -51,12 +51,14 @@ import { RtExcelService } from '../../services/rtExcelService';
 import { RtExcelAndClaimSheet, ExtraSheetType } from './RtExcelAndClaimSheet';
 import { MonetizationService } from '../../services/monetizationService';
 import { EncryptedBackupPanel } from '../common/EncryptedBackupPanel';
+import { RealtimeRelayService } from '../../services/realtimeRelayService';
 
 interface RtQuViewProps {
   onBackToMain: () => void;
   onOpenUsahaQu: () => void;
   onOpenSiagaQu?: () => void;
   showNotification: (msg: string) => void;
+  initialTab?: MainTab;
 }
 
 type MainTab = 'ringkasan' | 'forum' | 'keuangan' | 'iuran' | 'pengurus';
@@ -78,6 +80,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
   onOpenUsahaQu,
   onOpenSiagaQu,
   showNotification,
+  initialTab = 'ringkasan',
 }) => {
   // Shared synced state
   const [profile, setProfile] = useState<PaguyubanProfile>(() => RtSiagaStorage.getProfile());
@@ -116,7 +119,10 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
   );
 
   // Navigation & UI States
-  const [activeTab, setActiveTab] = useState<MainTab>('ringkasan');
+  const [activeTab, setActiveTab] = useState<MainTab>(initialTab);
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
   const [forumFilter, setForumFilter] = useState<'semua' | 'undangan' | ForumCategory>('semua');
   const [expandedCommentsPostId, setExpandedCommentsPostId] = useState<string | null>(null);
   const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
@@ -1613,6 +1619,16 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                                   'active',
                                   'Koordinator Keamanan'
                                 );
+                                RealtimeRelayService.publish(
+                                  RealtimeRelayService.getRtChannel(),
+                                  'rt:siaga_status',
+                                  {
+                                    email: member.email,
+                                    phone: member.phone,
+                                    status: 'active',
+                                    verifiedBy: 'Koordinator Keamanan',
+                                  }
+                                );
                                 showNotification(`SiagaQu untuk ${member.name} berhasil diaktifkan.`);
                               }}
                               className="min-h-[34px] px-2.5 bg-emerald-700 text-white rounded-lg text-[11px] font-bold"
@@ -1628,6 +1644,17 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                                   'suspended',
                                   'Koordinator Keamanan',
                                   'Dibekukan oleh Koordinator Keamanan'
+                                );
+                                RealtimeRelayService.publish(
+                                  RealtimeRelayService.getRtChannel(),
+                                  'rt:siaga_status',
+                                  {
+                                    email: member.email,
+                                    phone: member.phone,
+                                    status: 'suspended',
+                                    verifiedBy: 'Koordinator Keamanan',
+                                    reason: 'Dibekukan oleh Koordinator Keamanan',
+                                  }
                                 );
                                 showNotification(`Akses SiagaQu ${member.name} dibekukan.`);
                               }}

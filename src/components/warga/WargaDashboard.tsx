@@ -33,17 +33,36 @@ import { RT_SYNC_EVENT, RtSiagaStorage, WargaMember, PaguyubanProfile } from '..
 
 interface WargaDashboardProps {
   onOpenLeluhurQu: () => void;
-  onOpenRtQu: () => void;
+  onOpenRtQu: (tab?: 'ringkasan' | 'forum' | 'keuangan' | 'iuran' | 'pengurus') => void;
   onOpenSiagaQu: () => void;
   onOpenUsahaQu: (mode?: 'resto' | 'modular') => void;
   onOpenModularQu?: () => void;
   onOpenBantuan: () => void;
-  onOpenChatQu: () => void;
+  onOpenChatQu: (tab?: 'community' | 'chats' | 'announcements' | 'emergency') => void;
   onOpenMuamalahQu: () => void;
-  onOpenAreaQu: () => void;
+  onOpenAreaQu: (tab?: 'jelajah' | 'lapak' | 'aktivitas' | 'identitas') => void;
   onOpenEmptyModule: (moduleId: string) => void;
   onOpenLogin?: (reason?: string) => void;
   activeOrderCount?: number;
+}
+
+function getLiveKasMasukFormatted(): string {
+  const total = RtSiagaStorage.getTransactions()
+    .filter(tx => tx.type === 'masuk')
+    .reduce((sum, tx) => sum + tx.amount, 0);
+  return total.toLocaleString('id-ID');
+}
+
+function getLiveUnreadChatCount(): number {
+  try {
+    const raw = localStorage.getItem('wargaqu_chat_rooms_v1');
+    if (!raw) return 5;
+    const rooms = JSON.parse(raw) as Array<{ unreadCount?: number }>;
+    if (!Array.isArray(rooms)) return 0;
+    return rooms.reduce((sum, r) => sum + (r.unreadCount || 0), 0);
+  } catch {
+    return 0;
+  }
 }
 
 export const WargaDashboard: React.FC<WargaDashboardProps> = ({
@@ -65,18 +84,24 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
   const [authAccount, setAuthAccount] = useState<AuthAccount | null>(() => AuthService.getAccount());
   const [rtProfile, setRtProfile] = useState<PaguyubanProfile>(() => RtSiagaStorage.getProfile());
   const [rtMember, setRtMember] = useState<WargaMember>(() => RtSiagaStorage.getCurrentMember());
+  const [realBalance, setRealBalance] = useState<string>(() => getLiveKasMasukFormatted());
+  const [unreadChatCount, setUnreadChatCount] = useState<number>(() => getLiveUnreadChatCount());
 
   useEffect(() => {
     const syncAll = () => {
       setAuthAccount(AuthService.getAccount());
       setRtProfile(RtSiagaStorage.getProfile());
       setRtMember(RtSiagaStorage.getCurrentMember());
+      setRealBalance(getLiveKasMasukFormatted());
+      setUnreadChatCount(getLiveUnreadChatCount());
     };
     window.addEventListener(AUTH_SYNC_EVENT, syncAll);
     window.addEventListener(RT_SYNC_EVENT, syncAll);
+    window.addEventListener('focus', syncAll);
     return () => {
       window.removeEventListener(AUTH_SYNC_EVENT, syncAll);
       window.removeEventListener(RT_SYNC_EVENT, syncAll);
+      window.removeEventListener('focus', syncAll);
     };
   }, []);
 
@@ -87,7 +112,6 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
     }, 2500);
   };
 
-  const realBalance = '2.450.000';
   const maskedBalance = '••••••••';
 
   return (
@@ -215,7 +239,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
           {/* Card Footer Link */}
           <div className="pt-2 border-t border-emerald-50 flex justify-between items-center text-xs font-semibold text-emerald-700">
             <button
-              onClick={() => onOpenEmptyModule('riwayat_iuran')}
+              onClick={() => onOpenRtQu('iuran')}
               className="flex items-center gap-1.5 hover:text-emerald-800 hover:underline active:opacity-80"
             >
               <Receipt className="w-4 h-4 text-emerald-600" />
@@ -257,7 +281,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
 
             {/* 2. RtQu */}
             <button
-              onClick={onOpenRtQu}
+              onClick={() => onOpenRtQu('ringkasan')}
               className="flex flex-col items-center group active:scale-95 transition"
               title="Buka Modul RtQu"
             >
@@ -285,7 +309,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
 
             {/* 3. AreaQu */}
             <button
-              onClick={onOpenAreaQu}
+              onClick={() => onOpenAreaQu('jelajah')}
               className="flex flex-col items-center group active:scale-95 transition"
               title="Buka Modul AreaQu"
             >
@@ -342,16 +366,18 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
 
             {/* 7. ChatQu */}
             <button
-              onClick={onOpenChatQu}
+              onClick={() => onOpenChatQu('chats')}
               className="flex flex-col items-center group relative active:scale-95 transition"
               title="Buka ChatQu Forum Warga"
             >
               <div className="w-12 h-12 rounded-2xl bg-sky-50 border border-sky-100 flex items-center justify-center text-sky-700 group-hover:scale-105 transition shadow-xs">
                 <MessageSquare className="w-6 h-6" />
               </div>
-              <span className="absolute -top-1 right-1 bg-emerald-600 text-white text-[9px] font-bold px-1 rounded-full">
-                3
-              </span>
+              {unreadChatCount > 0 && (
+                <span className="absolute -top-1 right-1 bg-emerald-600 text-white text-[9px] font-bold px-1 rounded-full">
+                  {unreadChatCount}
+                </span>
+              )}
               <span className="text-[11px] font-medium text-slate-700 mt-1.5 text-center leading-tight">
                 ChatQu
               </span>
@@ -452,7 +478,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
 
         {/* ANNOUNCEMENT / BANNER CAROUSEL */}
         <div
-          onClick={() => showToast('Detail Kegiatan: Gotong Royong Minggu Pagi jam 07:00')}
+          onClick={() => onOpenRtQu('forum')}
           className="bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-700 rounded-xl p-3.5 text-white shadow-sm flex items-center justify-between cursor-pointer hover:opacity-95 active:scale-[0.99] transition border border-emerald-500/30"
         >
           <div className="space-y-0.5">
@@ -460,7 +486,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
               Kegiatan Warga
             </div>
             <h4 className="text-xs font-bold leading-tight">Gotong Royong Minggu Ini!</h4>
-            <p className="text-[11px] text-emerald-100">Dapatkan Poin Keaktifan Warga &gt;</p>
+            <p className="text-[11px] text-emerald-100">Lihat Jadwal &amp; RSVP di Forum RT &gt;</p>
           </div>
           <div className="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center shrink-0">
             <Sparkles className="w-5 h-5 text-amber-300" />
@@ -469,7 +495,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
 
         {/* EXTRA FEATURE STRIP (NFC / QUICK BAYAR BANNER) */}
         <div
-          onClick={() => onOpenEmptyModule('qris')}
+          onClick={() => onOpenRtQu('iuran')}
           className="bg-white rounded-xl p-3 border border-emerald-100/90 flex items-center justify-between shadow-xs cursor-pointer hover:bg-emerald-50/50 active:scale-[0.99] transition"
         >
           <div className="flex items-center gap-3">
@@ -512,7 +538,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
             Kabar RT 03
           </h3>
           <div
-            onClick={() => showToast('Membuka pengumuman: Jadwal Ronda Malam')}
+            onClick={() => onOpenChatQu('announcements')}
             className="flex gap-3 items-center cursor-pointer hover:opacity-85 transition"
           >
             <div className="w-12 h-12 bg-emerald-50 border border-emerald-100 rounded-lg shrink-0 flex items-center justify-center text-emerald-700">
@@ -522,7 +548,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
               <p className="text-xs font-semibold text-slate-800 line-clamp-1">
                 Jadwal Ronda Malam Bulan Ini Telah Diperbarui
               </p>
-              <p className="text-[10px] text-slate-400">2 Jam yang lalu • Pengurus RT</p>
+              <p className="text-[10px] text-slate-400">2 Jam yang lalu • Buka Warta RT &gt;</p>
             </div>
           </div>
         </div>
@@ -542,7 +568,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
         {/* Aktivitas */}
         <button
           className="flex flex-col items-center gap-0.5 text-slate-400 hover:text-emerald-700 active:scale-95 transition"
-          onClick={() => onOpenEmptyModule('aktivitas')}
+          onClick={() => onOpenAreaQu('aktivitas')}
         >
           <History className="w-5 h-5" />
           <span className="text-[10px] font-medium">Aktivitas</span>
@@ -551,9 +577,9 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
         {/* CENTER FLOATING WargaPay / QRIS BUTTON */}
         <div className="relative -top-5 flex flex-col items-center">
           <button
-            onClick={() => onOpenEmptyModule('qris')}
+            onClick={() => onOpenRtQu('iuran')}
             className="w-14 h-14 bg-gradient-to-tr from-[#047857] via-[#059669] to-[#2dd4bf] rounded-full p-0.5 shadow-lg shadow-emerald-700/30 flex items-center justify-center text-white border-4 border-[#f0fdf4] pulse-animation active:scale-95 transition"
-            title="Scan QRIS WargaQu"
+            title="Bayar Iuran & QRIS RTQu"
           >
             <div className="w-full h-full rounded-full flex flex-col items-center justify-center">
               <QrCode className="w-6 h-6 text-white" />
@@ -565,7 +591,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
         {/* Untukmu */}
         <button
           className="flex flex-col items-center gap-0.5 text-slate-400 hover:text-emerald-700 relative active:scale-95 transition"
-          onClick={() => onOpenEmptyModule('untukmu')}
+          onClick={onOpenMuamalahQu}
         >
           <Sparkles className="w-5 h-5" />
           <span className="text-[10px] font-medium">Untukmu</span>

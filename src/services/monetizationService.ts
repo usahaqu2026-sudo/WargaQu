@@ -1,5 +1,6 @@
 import { AuthService } from './authService';
 import { ZeroTrustService } from './zeroTrustService';
+import { RealtimeRelayService } from './realtimeRelayService';
 
 export type MonetizableModuleId =
   | 'areaqu_lapak'
@@ -207,7 +208,25 @@ export const MonetizationService = {
       );
     }
     emitMonetizationSync();
+    RealtimeRelayService.publish('admin:policy', 'admin:monetize_rules', next);
     return next;
+  },
+
+  applyRemoteRules(remoteRules: ModuleMonetizationRule[]): void {
+    if (!Array.isArray(remoteRules) || remoteRules.length === 0) return;
+    const merged = DEFAULT_RULES.map(def => {
+      const found = remoteRules.find(r => r.moduleId === def.moduleId);
+      if (!found) return def;
+      return {
+        ...def,
+        enabled: Boolean(found.enabled),
+        feeMode: found.feeMode || def.feeMode,
+        flatFee: Math.min(30000, Math.max(2000, Number(found.flatFee) || def.flatFee)),
+        percentRate: 1,
+      };
+    });
+    saveJson(RULES_KEY, merged);
+    emitMonetizationSync();
   },
 
   isProtectedLifeSafetyScope(scope: 'umum_rt' | 'pribadi_hp' | 'keluarga' | 'perusahaan'): boolean {

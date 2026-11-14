@@ -25,7 +25,13 @@ import {
 import { StorageService } from './services/storage';
 import { AUTH_SYNC_EVENT, AuthAccount, AuthService } from './services/authService';
 import { RtSiagaStorage } from './services/rtSiagaStorage';
-import { ZeroTrustService } from './services/zeroTrustService';
+import { ZeroTrustService, DeviceTrustStatus } from './services/zeroTrustService';
+import { MonetizationService, ModuleMonetizationRule } from './services/monetizationService';
+import {
+  REALTIME_RELAY_EVENT,
+  RelayIncomingEvent,
+  RealtimeRelayService,
+} from './services/realtimeRelayService';
 
 type AppScreen = 'warga' | 'akun' | 'admin_zero_trust' | 'leluhurqu' | 'rtqu' | 'siagaqu' | 'chatqu' | 'muamalahqu' | 'areaqu' | 'usahaqu' | 'modularqu' | 'bantuan' | 'empty_module';
 
@@ -34,6 +40,9 @@ export default function App() {
   const [currentScreen, setCurrentScreen] = useState<AppScreen>('warga');
   const [selectedEmptyModule, setSelectedEmptyModule] = useState<string>('areaqu');
   const [usahaQuMode, setUsahaQuMode] = useState<'resto' | 'modular'>('resto');
+  const [rtQuInitialTab, setRtQuInitialTab] = useState<'ringkasan' | 'forum' | 'keuangan' | 'iuran' | 'pengurus'>('ringkasan');
+  const [areaQuInitialTab, setAreaQuInitialTab] = useState<'jelajah' | 'lapak' | 'aktivitas' | 'identitas'>('jelajah');
+  const [chatQuInitialTab, setChatQuInitialTab] = useState<'community' | 'chats' | 'announcements' | 'emergency'>('chats');
 
   // Core POS Data States (Persisted for UsahaQu / Bakso Qu)
   const [tables, setTables] = useState<TableItem[]>([]);
@@ -76,6 +85,65 @@ export default function App() {
 
     window.addEventListener(AUTH_SYNC_EVENT, handleAuthSync);
 
+    RealtimeRelayService.start();
+
+    const handleGlobalRelay = (evt: Event) => {
+      const detail = (evt as CustomEvent<RelayIncomingEvent>).detail;
+      if (!detail) return;
+
+      if (detail.eventName === 'admin:monetize_rules' && Array.isArray(detail.payload)) {
+        MonetizationService.applyRemoteRules(detail.payload as ModuleMonetizationRule[]);
+      } else if (detail.eventName === 'zt:device_freeze' && detail.payload && typeof detail.payload === 'object') {
+        const p = detail.payload as { deviceId?: string; status?: DeviceTrustStatus; reason?: string };
+        if (p.deviceId && p.status) {
+          ZeroTrustService.applyRemoteFreeze(p.deviceId, p.status, p.reason);
+          if (p.deviceId === AuthService.getHiddenDeviceId() && p.status === 'frozen_lost') {
+            showNotification('PERHATIAN: Perangkat ini dibekukan oleh Zero Trust (HP Hilang).');
+          }
+        }
+      } else if (detail.eventName === 'zt:frozen_list' && Array.isArray(detail.payload)) {
+        const currentDev = AuthService.getHiddenDeviceId();
+        if (detail.payload.includes(currentDev)) {
+          ZeroTrustService.applyRemoteFreeze(currentDev, 'frozen_lost', 'Sinkronisasi daftar beku Zero Trust');
+        }
+      } else if (detail.eventName === 'rt:siaga_status' && detail.payload && typeof detail.payload === 'object') {
+        const p = detail.payload as {
+          email?: string;
+          phone?: string;
+          status?: 'active' | 'pending' | 'suspended';
+          verifiedBy?: string;
+          reason?: string;
+        };
+        const current = RtSiagaStorage.getCurrentMember();
+        const acc = AuthService.getAccount();
+        const matchesMe =
+          (p.email && acc?.email && p.email.toLowerCase() === acc.email.toLowerCase()) ||
+          (p.phone && acc?.phone && p.phone.replace(/\D/g, '') === acc.phone.replace(/\D/g, ''));
+        if (matchesMe && p.status) {
+          RtSiagaStorage.setMemberSiagaStatus(current.id, p.status, p.verifiedBy || 'Pengurus RT', p.reason);
+          showNotification(
+            p.status === 'active'
+              ? 'SiagaQu Umum Anda telah DIAKTIFKAN oleh Pengurus RT!'
+              : 'Status SiagaQu Umum Anda diperbarui oleh Pengurus RT.'
+          );
+        }
+      } else if (detail.eventName === 'siaga:alert' && detail.payload && typeof detail.payload === 'object') {
+        const p = detail.payload as { category?: string; senderName?: string; scopeLabel?: string };
+        showNotification(
+          `DARURAT SIAGAQU (${p.scopeLabel || 'Warga'}): ${p.category || 'Darurat'} dari ${p.senderName || 'Warga'}`
+        );
+      } else if (detail.eventName === 'order:areaqu' && detail.payload && typeof detail.payload === 'object') {
+        const p = detail.payload as { lapakName?: string; consumerName?: string };
+        showNotification(`Pesanan AreaQu baru untuk ${p.lapakName || 'Lapak'} dari ${p.consumerName || 'Warga'}`);
+      } else if (detail.eventName === 'order:muamalahqu' && detail.payload && typeof detail.payload === 'object') {
+        const p = detail.payload as { buyerName?: string; total?: number };
+        showNotification(
+          `Order MuamalahQu baru dari ${p.buyerName || 'Warga'} (Rp ${(p.total || 0).toLocaleString('id-ID')})`
+        );
+      }
+    };
+    window.addEventListener(REALTIME_RELAY_EVENT, handleGlobalRelay);
+
     setTables(StorageService.getTables());
     setMenuList(StorageService.getMenu());
     setIngredients(StorageService.getIngredients());
@@ -90,6 +158,7 @@ export default function App() {
 
     return () => {
       window.removeEventListener(AUTH_SYNC_EVENT, handleAuthSync);
+      window.removeEventListener(REALTIME_RELAY_EVENT, handleGlobalRelay);
     };
   }, []);
 
@@ -164,9 +233,11 @@ export default function App() {
     showNotification('Membuka LeluhurQu: Silsilah Trah Keluarga');
   };
 
-  const handleOpenRtQu = () => {
+  const handleOpenRtQu = (tab?: 'ringkasan' | 'forum' | 'keuangan' | 'iuran' | 'pengurus') => {
+    const targetTab = typeof tab === 'string' ? tab : 'ringkasan';
+    setRtQuInitialTab(targetTab);
     setCurrentScreen('rtqu');
-    window.history.pushState({ screen: 'rtqu' }, '', '#rtqu');
+    window.history.pushState({ screen: 'rtqu', tab: targetTab }, '', '#rtqu');
   };
 
   const handleOpenSiagaQu = () => {
@@ -195,9 +266,11 @@ export default function App() {
     showNotification('Membuka UsahaQu Smart Care & Pusat Bantuan');
   };
 
-  const handleOpenChatQu = () => {
+  const handleOpenChatQu = (tab?: 'community' | 'chats' | 'announcements' | 'emergency') => {
+    const targetTab = typeof tab === 'string' ? tab : 'chats';
+    setChatQuInitialTab(targetTab);
     setCurrentScreen('chatqu');
-    window.history.pushState({ screen: 'chatqu' }, '', '#chatqu');
+    window.history.pushState({ screen: 'chatqu', tab: targetTab }, '', '#chatqu');
   };
 
   const handleOpenMuamalahQu = () => {
@@ -205,9 +278,11 @@ export default function App() {
     window.history.pushState({ screen: 'muamalahqu' }, '', '#muamalahqu');
   };
 
-  const handleOpenAreaQu = () => {
+  const handleOpenAreaQu = (tab?: 'jelajah' | 'lapak' | 'aktivitas' | 'identitas') => {
+    const targetTab = typeof tab === 'string' ? tab : 'jelajah';
+    setAreaQuInitialTab(targetTab);
     setCurrentScreen('areaqu');
-    window.history.pushState({ screen: 'areaqu' }, '', '#areaqu');
+    window.history.pushState({ screen: 'areaqu', tab: targetTab }, '', '#areaqu');
   };
 
   const handleOpenAdminZeroTrust = () => {
@@ -319,6 +394,7 @@ export default function App() {
           onOpenUsahaQu={handleOpenUsahaQu}
           onOpenSiagaQu={handleOpenSiagaQu}
           showNotification={showNotification}
+          initialTab={rtQuInitialTab}
         />
       )}
 
@@ -328,7 +404,7 @@ export default function App() {
           onBackToMain={handleBackToWarga}
           showNotification={showNotification}
           onOpenChatQu={handleOpenChatQu}
-          onOpenRtQu={handleOpenRtQu}
+          onOpenRtQu={() => handleOpenRtQu('pengurus')}
           onOpenLogin={handleOpenLogin}
         />
       )}
@@ -339,6 +415,7 @@ export default function App() {
           onBackToMain={handleBackToWarga}
           showNotification={showNotification}
           onOpenLogin={handleOpenLogin}
+          initialTab={chatQuInitialTab}
         />
       )}
 
@@ -362,6 +439,7 @@ export default function App() {
           onOpenUsahaQu={handleOpenUsahaQu}
           menuList={menuList}
           showNotification={showNotification}
+          initialTab={areaQuInitialTab}
         />
       )}
 

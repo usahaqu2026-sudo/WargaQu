@@ -42,6 +42,11 @@ import { AUTH_SYNC_EVENT, AuthService } from '../../services/authService';
 import { MonetizationService } from '../../services/monetizationService';
 import { ModularFeeSheet } from '../monetization/ModularFeeSheet';
 import {
+  REALTIME_RELAY_EVENT,
+  RelayIncomingEvent,
+  RealtimeRelayService,
+} from '../../services/realtimeRelayService';
+import {
   POICategory,
   CatalogProduct,
   LapakItem,
@@ -64,6 +69,7 @@ interface AreaQuViewProps {
   onOpenUsahaQu: () => void;
   menuList: MenuItem[];
   showNotification: (msg: string) => void;
+  initialTab?: AreaMainTab;
 }
 
 export interface LocationPreset {
@@ -509,12 +515,16 @@ export const AreaQuView: React.FC<AreaQuViewProps> = ({
   onOpenSiagaQu,
   onOpenChatQu,
   menuList,
-  showNotification
+  showNotification,
+  initialTab = 'jelajah'
 }) => {
   // ---------------------------------------------------------------------------
   // 1. 4-TAB NAVIGATION & SUB-MENU STATES
   // ---------------------------------------------------------------------------
-  const [activeTab, setActiveTab] = useState<AreaMainTab>('jelajah');
+  const [activeTab, setActiveTab] = useState<AreaMainTab>(initialTab);
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
   const [jelajahSubMode, setJelajahSubMode] = useState<'peta' | 'daftar'>('peta');
   const [lapakSubTab, setLapakSubTab] = useState<'lokasi' | 'katalog'>('lokasi');
   const [identitySubTab, setIdentitySubTab] = useState<'konsumen' | 'pedagang' | 'keamanan'>('konsumen');
@@ -685,6 +695,23 @@ export const AreaQuView: React.FC<AreaQuViewProps> = ({
   const myLapak = useMemo(() => {
     return lapaks.find(l => l.isMyLapak) || lapaks[0];
   }, [lapaks]);
+
+  useEffect(() => {
+    const handleRemoteAreaOrder = (evt: Event) => {
+      const detail = (evt as CustomEvent<RelayIncomingEvent>).detail;
+      if (!detail || detail.eventName !== 'order:areaqu' || !detail.payload || typeof detail.payload !== 'object') {
+        return;
+      }
+      const p = detail.payload as { order?: AreaOrderItem };
+      const incomingOrder = p.order;
+      if (!incomingOrder?.id) return;
+      if (myLapak && incomingOrder.lapakId !== myLapak.id) return;
+
+      setOrders(prev => (prev.some(o => o.id === incomingOrder.id) ? prev : [incomingOrder, ...prev]));
+    };
+    window.addEventListener(REALTIME_RELAY_EVENT, handleRemoteAreaOrder);
+    return () => window.removeEventListener(REALTIME_RELAY_EVENT, handleRemoteAreaOrder);
+  }, [myLapak?.id]);
 
   // ---------------------------------------------------------------------------
   // 5. MAP INSTANCE & LEAFLET REFS
@@ -1373,6 +1400,13 @@ export const AreaQuView: React.FC<AreaQuViewProps> = ({
     };
 
     setOrders(prev => [newOrder, ...prev]);
+
+    RealtimeRelayService.publish(RealtimeRelayService.getRtChannel(), 'order:areaqu', {
+      order: newOrder,
+      lapakId: newOrder.lapakId,
+      lapakName: newOrder.lapakName,
+      consumerName: newOrder.consumerName,
+    });
 
     const areaRule = MonetizationService.getRule('areaqu_lapak');
     if (areaRule.enabled && areaRule.feeMode !== 'flat') {

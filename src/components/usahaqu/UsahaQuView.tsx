@@ -37,6 +37,7 @@ import {
 } from '../../types';
 import { StorageService } from '../../services/storage';
 import { PrinterService } from '../../services/printer';
+import { MonetizationService } from '../../services/monetizationService';
 
 interface UsahaQuViewProps {
   onBackToWarga: () => void;
@@ -340,7 +341,7 @@ export const UsahaQuView: React.FC<UsahaQuViewProps> = ({
 
   const handleProceedToPay = (table: TableItem) => {
     if (!table.orderId || !activeOrders[table.orderId]) {
-      alert('Data pesanan meja tidak ditemukan.');
+      showNotification('Data pesanan meja tidak ditemukan.');
       return;
     }
     const currentOrder = activeOrders[table.orderId];
@@ -353,6 +354,11 @@ export const UsahaQuView: React.FC<UsahaQuViewProps> = ({
   ) => {
     StorageService.addTransaction(completedOrder);
     setHistory([completedOrder, ...history]);
+    MonetizationService.recordCharge({
+      moduleId: 'usahaqu_pro',
+      actionLabel: `Transaksi Kasir Resto Qu (${completedOrder.receiptNumber})`,
+      grossAmount: completedOrder.total,
+    });
 
     const copyActive = { ...activeOrders };
     delete copyActive[completedOrder.id];

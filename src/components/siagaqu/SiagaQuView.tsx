@@ -51,6 +51,11 @@ import {
   SiagaCircleType,
   InvitedCircleMember,
 } from '../../services/siagaCircleService';
+import {
+  REALTIME_RELAY_EVENT,
+  RelayIncomingEvent,
+  RealtimeRelayService,
+} from '../../services/realtimeRelayService';
 
 interface SiagaQuViewProps {
   onBackToMain: () => void;
@@ -174,6 +179,7 @@ export const SiagaQuView: React.FC<SiagaQuViewProps> = ({
   const [activeTranscript, setActiveTranscript] = useState<string>('Merekam audio...');
   const [activeEmergencyData, setActiveEmergencyData] = useState<EmergencyLog | null>(null);
   const emergencyIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const activeEmergencyIdRef = useRef<string | null>(null);
 
   // Web Audio Context & Oscillator References
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -260,6 +266,71 @@ export const SiagaQuView: React.FC<SiagaQuViewProps> = ({
       localStorage.setItem('siagaqu_logs', JSON.stringify(logs));
     } catch {}
   }, [logs]);
+
+  useEffect(() => {
+    const handleRemoteSiaga = (evt: Event) => {
+      const detail = (evt as CustomEvent<RelayIncomingEvent>).detail;
+      if (!detail) return;
+
+      if (detail.eventName === 'siaga:alert' && detail.payload && typeof detail.payload === 'object') {
+        const p = detail.payload as {
+          id?: string;
+          timestamp?: string;
+          date?: string;
+          category?: string;
+          scope?: 'umum_rt' | SiagaCircleType;
+          scopeLabel?: string;
+          inviteCode?: string;
+          senderName?: string;
+          location?: string;
+          transcript?: string;
+        };
+        if (!p.id) return;
+
+        // Verify eligibility: Umum RT requires RT activation; private circles require matching invite code
+        if (p.scope === 'umum_rt') {
+          if (RtSiagaStorage.getCurrentMember().siagaStatus !== 'active') return;
+        } else if (p.inviteCode) {
+          const codeUpper = p.inviteCode.toUpperCase();
+          const hasCircle =
+            SiagaCircleService.getCircles().some(c => c.inviteCode.toUpperCase() === codeUpper) ||
+            SiagaCircleService.getInvitedMembers().some(m => m.inviteCode.toUpperCase() === codeUpper);
+          if (!hasCircle) return;
+        }
+
+        const remoteLog: EmergencyLog = {
+          id: p.id,
+          timestamp: p.timestamp || new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+          date: p.date || new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'short' }),
+          category: p.category || 'Darurat Warga',
+          mode: 'REAL',
+          location: p.location || `${p.scopeLabel || 'Jaringan SiagaQu'} (${p.senderName || 'Warga'})`,
+          transcript: p.transcript || '"Sinyal darurat masuk melalui relay SiagaQu!"',
+        };
+
+        setLogs(prev => (prev.some(item => item.id === remoteLog.id) ? prev : [remoteLog, ...prev]));
+        activeEmergencyIdRef.current = remoteLog.id;
+        setActiveEmergencyData(remoteLog);
+        setActiveTranscript(remoteLog.transcript);
+        setIsEmergencyActive(true);
+        setEmergencySecondsLeft(0);
+        setActiveStep(5);
+        playSirenSound();
+      } else if (detail.eventName === 'siaga:cancel' && detail.payload && typeof detail.payload === 'object') {
+        const p = detail.payload as { id?: string };
+        if (p.id && activeEmergencyIdRef.current === p.id) {
+          stopSirenSound();
+          if (emergencyIntervalRef.current) clearInterval(emergencyIntervalRef.current);
+          activeEmergencyIdRef.current = null;
+          setIsEmergencyActive(false);
+          showNotification('Sinyal darurat dibatalkan oleh pengirim.');
+        }
+      }
+    };
+
+    window.addEventListener(REALTIME_RELAY_EVENT, handleRemoteSiaga);
+    return () => window.removeEventListener(REALTIME_RELAY_EVENT, handleRemoteSiaga);
+  }, []);
 
   // Clean up sounds and listeners on unmount
   useEffect(() => {
@@ -613,7 +684,36 @@ export const SiagaQuView: React.FC<SiagaQuViewProps> = ({
       location: `${rtProfile.orgName} - ${currentMember.block} (${currentMember.name})`,
       transcript,
     };
+    activeEmergencyIdRef.current = newLog.id;
     setActiveEmergencyData(newLog);
+
+    if (!isSimulasiMode) {
+      const targetCircle =
+        siagaScope === 'umum_rt'
+          ? undefined
+          : SiagaCircleService.getCircles().find(c => c.type === siagaScope);
+      const targetChannel =
+        siagaScope === 'umum_rt'
+          ? RealtimeRelayService.getRtChannel()
+          : `circle:${(targetCircle?.inviteCode || 'PRIBADI').toUpperCase()}`;
+      const scopeLabel =
+        siagaScope === 'umum_rt'
+          ? 'Umum RT (500m-3km)'
+          : targetCircle?.name || 'Komunitas Pribadi';
+
+      RealtimeRelayService.publish(targetChannel, 'siaga:alert', {
+        id: newLog.id,
+        timestamp: newLog.timestamp,
+        date: newLog.date,
+        category: newLog.category,
+        scope: siagaScope,
+        scopeLabel,
+        inviteCode: targetCircle?.inviteCode,
+        senderName: authAccount ? AuthService.getDisplayName(authAccount) : currentMember.name,
+        location: newLog.location,
+        transcript: newLog.transcript,
+      });
+    }
 
     let sec = 5;
     let stepCount = 1;
@@ -634,6 +734,20 @@ export const SiagaQuView: React.FC<SiagaQuViewProps> = ({
   const cancelEmergency = () => {
     stopSirenSound();
     if (emergencyIntervalRef.current) clearInterval(emergencyIntervalRef.current);
+    if (!isSimulasiMode && activeEmergencyIdRef.current) {
+      const targetCircle =
+        siagaScope === 'umum_rt'
+          ? undefined
+          : SiagaCircleService.getCircles().find(c => c.type === siagaScope);
+      const targetChannel =
+        siagaScope === 'umum_rt'
+          ? RealtimeRelayService.getRtChannel()
+          : `circle:${(targetCircle?.inviteCode || 'PRIBADI').toUpperCase()}`;
+      RealtimeRelayService.publish(targetChannel, 'siaga:cancel', {
+        id: activeEmergencyIdRef.current,
+      });
+    }
+    activeEmergencyIdRef.current = null;
     setIsEmergencyActive(false);
     showNotification('Sinyal darurat dibatalkan.');
   };
