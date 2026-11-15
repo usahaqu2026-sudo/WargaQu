@@ -62,17 +62,82 @@ export default function App() {
 
   // Initial Data Load & Hidden Device ID Init
   useEffect(() => {
+    const extractInviteFromLocation = () => {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const fromQuery = params.get('t') || params.get('trah') || params.get('trahInvite');
+        if (fromQuery && fromQuery.trim()) return fromQuery.trim();
+        const hash = window.location.hash || '';
+        const tIdx = hash.indexOf('t=');
+        if (tIdx !== -1) {
+          const hp = new URLSearchParams(hash.slice(tIdx));
+          const fromHash = hp.get('t') || hp.get('trahInvite');
+          if (fromHash && fromHash.trim()) return fromHash.trim();
+        }
+      } catch {
+        // ignore URL errors
+      }
+      return '';
+    };
+
+    const extractRtInviteFromLocation = () => {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const fromQuery = params.get('rt') || params.get('rtInvite');
+        if (fromQuery && fromQuery.trim()) return fromQuery.trim();
+        const hash = window.location.hash || '';
+        const rtIdx = hash.indexOf('rt=');
+        if (rtIdx !== -1) {
+          const hp = new URLSearchParams(hash.slice(rtIdx));
+          const fromHash = hp.get('rt') || hp.get('rtInvite');
+          if (fromHash && fromHash.trim()) return fromHash.trim();
+        }
+      } catch {
+        // ignore URL errors
+      }
+      return '';
+    };
+
     try {
-      const params = new URLSearchParams(window.location.search);
-      const trahInvite = params.get('trahInvite');
-      if (trahInvite && trahInvite.trim()) {
-        localStorage.setItem('wargaqu_pending_trah_invite_v1', trahInvite.trim());
+      const trahInvite = extractInviteFromLocation();
+      const rtInvite = extractRtInviteFromLocation();
+      if (trahInvite) {
+        localStorage.setItem('wargaqu_pending_trah_invite_v1', trahInvite);
         setCurrentScreen('leluhurqu');
         window.history.replaceState({ screen: 'leluhurqu' }, '', `${window.location.pathname}#leluhurqu`);
+      } else if (rtInvite) {
+        localStorage.setItem('wargaqu_pending_rt_invite_v1', rtInvite);
+        setCurrentScreen('rtqu');
+        window.history.replaceState({ screen: 'rtqu' }, '', `${window.location.pathname}#rtqu`);
       }
     } catch {
       // ignore URL/storage errors
     }
+
+    const onHashInviteCheck = () => {
+      const trahInvite = extractInviteFromLocation();
+      if (trahInvite) {
+        try {
+          localStorage.setItem('wargaqu_pending_trah_invite_v1', trahInvite);
+        } catch {
+          // ignore
+        }
+        setCurrentScreen('leluhurqu');
+        window.dispatchEvent(new CustomEvent('wargaqu-trah-invite-arrived'));
+        return;
+      }
+      const rtInvite = extractRtInviteFromLocation();
+      if (rtInvite) {
+        try {
+          localStorage.setItem('wargaqu_pending_rt_invite_v1', rtInvite);
+        } catch {
+          // ignore
+        }
+        setCurrentScreen('rtqu');
+        window.dispatchEvent(new CustomEvent('wargaqu-rt-invite-arrived'));
+      }
+    };
+    window.addEventListener('hashchange', onHashInviteCheck);
 
     AuthService.getHiddenDeviceId(); // ensure persistent hidden device token exists
     const currentAcc = AuthService.getAccount();
@@ -169,6 +234,7 @@ export default function App() {
     setPrinterConfig(StorageService.getPrinterConfig());
 
     return () => {
+      window.removeEventListener('hashchange', onHashInviteCheck);
       window.removeEventListener(AUTH_SYNC_EVENT, handleAuthSync);
       window.removeEventListener(REALTIME_RELAY_EVENT, handleGlobalRelay);
     };
@@ -190,7 +256,13 @@ export default function App() {
 
   // Tangani tombol Back HP / Browser di tingkat aplikasi
   useEffect(() => {
-    window.history.replaceState({ screen: 'warga' }, '', '#warga');
+    const hasPendingInvite = Boolean(
+      localStorage.getItem('wargaqu_pending_trah_invite_v1') ||
+        localStorage.getItem('wargaqu_pending_rt_invite_v1')
+    );
+    if (!hasPendingInvite) {
+      window.history.replaceState({ screen: 'warga' }, '', '#warga');
+    }
 
     const handleGlobalBack = () => {
       // Jika sedang berada di sub-screen selain warga, kembalikan ke beranda warga

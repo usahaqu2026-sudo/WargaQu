@@ -23,11 +23,17 @@ import {
   FolderPlus,
   RefreshCw,
   AlertTriangle,
+  History,
+  UserCheck,
+  Search,
+  Link2,
 } from 'lucide-react';
 import {
   TrahCategory,
   LineageSide,
   PhotoShape,
+  LeluhurActivityLog,
+  LeluhurLogActionType,
   compressImageFile,
 } from './LeluhurQuView';
 import { EncryptedBackupPanel } from '../common/EncryptedBackupPanel';
@@ -72,10 +78,14 @@ interface LeluhurSettingsViewProps {
   onResetExampleSanta: () => void;
   trahPostsCount: number;
   savedDesignsCount: number;
+  activityLogs: LeluhurActivityLog[];
+  onClearActivityLogs: () => void;
+  initialSectionTab?: SettingsSectionTab;
+  sectionTriggerKey?: number;
   showNotification: (msg: string) => void;
 }
 
-type SettingsSectionTab = 'account' | 'trah' | 'backup' | 'preferences';
+export type SettingsSectionTab = 'account' | 'trah' | 'logs' | 'backup' | 'preferences';
 
 const LINEAGE_OPTIONS: Array<{ value: LineageSide; label: string; icon: string }> = [
   { value: 'ayah_user', label: 'Pilar 1: Trah Ayah (User)', icon: '👨' },
@@ -104,11 +114,27 @@ export const LeluhurSettingsView: React.FC<LeluhurSettingsViewProps> = ({
   onResetExampleSanta,
   trahPostsCount,
   savedDesignsCount,
+  activityLogs,
+  onClearActivityLogs,
+  initialSectionTab = 'account',
+  sectionTriggerKey = 0,
   showNotification,
 }) => {
-  const [activeTab, setActiveTab] = useState<SettingsSectionTab>('account');
+  const [activeTab, setActiveTab] = useState<SettingsSectionTab>(initialSectionTab);
+  React.useEffect(() => {
+    if (sectionTriggerKey > 0) {
+      setActiveTab(initialSectionTab);
+    }
+  }, [initialSectionTab, sectionTriggerKey]);
+
   const [draftProfile, setDraftProfile] = useState<LeluhurAccountProfile>(accountProfile);
   const [isUploadingAvatar, setIsUploadingAvatar] = useState<boolean>(false);
+
+  // Filter Log Aktivitas
+  const [logTrahFilter, setLogTrahFilter] = useState<string>('all');
+  const [logCategoryFilter, setLogCategoryFilter] = useState<'all' | 'claim_invite' | 'member' | 'system'>('all');
+  const [logSearchQuery, setLogSearchQuery] = useState<string>('');
+  const [confirmClearLogs, setConfirmClearLogs] = useState<boolean>(false);
 
   // Edit Trah inline state
   const [editingTrahId, setEditingTrahId] = useState<string | null>(null);
@@ -251,57 +277,79 @@ export const LeluhurSettingsView: React.FC<LeluhurSettingsViewProps> = ({
       </div>
 
       {/* Navigasi Tab Setting */}
-      <div className="bg-white rounded-2xl p-1.5 border border-stone-200 shadow-xs grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+      <div className="bg-white rounded-2xl p-1.5 border border-stone-200 shadow-xs grid grid-cols-2 sm:grid-cols-5 gap-1.5">
         <button
           type="button"
           onClick={() => setActiveTab('account')}
-          className={`py-2 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+          className={`py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
             activeTab === 'account'
               ? 'bg-emerald-700 text-white shadow-xs'
               : 'text-stone-600 hover:bg-stone-100'
           }`}
         >
           <User className="w-3.5 h-3.5" />
-          <span>Akun & Profil</span>
+          <span>Akun &amp; Profil</span>
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('trah')}
-          className={`py-2 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+          className={`py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
             activeTab === 'trah'
               ? 'bg-emerald-700 text-white shadow-xs'
               : 'text-stone-600 hover:bg-stone-100'
           }`}
         >
           <Layers className="w-3.5 h-3.5" />
-          <span>4 Pilar Trah</span>
+          <span>Kelola Trah</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveTab('logs')}
+          className={`py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+            activeTab === 'logs'
+              ? 'bg-emerald-700 text-white shadow-xs'
+              : 'text-stone-600 hover:bg-stone-100'
+          }`}
+        >
+          <History className="w-3.5 h-3.5" />
+          <span>Log Aktivitas</span>
+          {activityLogs.length > 0 && (
+            <span
+              className={`text-[9px] px-1.5 py-0.2 rounded-full font-black ${
+                activeTab === 'logs' ? 'bg-amber-400 text-stone-950' : 'bg-stone-200 text-stone-700'
+              }`}
+            >
+              {activityLogs.length}
+            </span>
+          )}
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('backup')}
-          className={`py-2 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+          className={`py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
             activeTab === 'backup'
               ? 'bg-emerald-700 text-white shadow-xs'
               : 'text-stone-600 hover:bg-stone-100'
           }`}
         >
           <Database className="w-3.5 h-3.5" />
-          <span>Data & Cadangan</span>
+          <span>Cadangan</span>
         </button>
 
         <button
           type="button"
           onClick={() => setActiveTab('preferences')}
-          className={`py-2 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+          className={`py-2 px-2.5 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition col-span-2 sm:col-span-1 ${
             activeTab === 'preferences'
               ? 'bg-emerald-700 text-white shadow-xs'
               : 'text-stone-600 hover:bg-stone-100'
           }`}
         >
           <SlidersHorizontal className="w-3.5 h-3.5" />
-          <span>Preferensi UI</span>
+          <span>Preferensi</span>
         </button>
       </div>
 
@@ -985,6 +1033,194 @@ export const LeluhurSettingsView: React.FC<LeluhurSettingsViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* ========================================================= */}
+      {/* TAB 5: LOG AKTIVITAS SILSILAH, KLAIM & UNDANGAN           */}
+      {/* ========================================================= */}
+      {activeTab === 'logs' && (() => {
+        const getActionMeta = (type: LeluhurLogActionType) => {
+          switch (type) {
+            case 'claim':
+              return { label: 'Klaim Profil', cls: 'bg-emerald-100 text-emerald-800 border-emerald-300', icon: <UserCheck className="w-3.5 h-3.5 text-emerald-700" /> };
+            case 'unclaim':
+              return { label: 'Lepas Klaim', cls: 'bg-stone-100 text-stone-700 border-stone-300', icon: <User className="w-3.5 h-3.5 text-stone-600" /> };
+            case 'invite_join':
+              return { label: 'Gabung Undangan', cls: 'bg-sky-100 text-sky-800 border-sky-300', icon: <Link2 className="w-3.5 h-3.5 text-sky-700" /> };
+            case 'invite_share':
+              return { label: 'Bagikan Link', cls: 'bg-indigo-100 text-indigo-800 border-indigo-300', icon: <Link2 className="w-3.5 h-3.5 text-indigo-700" /> };
+            case 'trah_create':
+              return { label: 'Buat Trah', cls: 'bg-amber-100 text-amber-900 border-amber-300', icon: <FolderPlus className="w-3.5 h-3.5 text-amber-700" /> };
+            case 'trah_update':
+              return { label: 'Ubah Trah', cls: 'bg-amber-50 text-amber-800 border-amber-200', icon: <Edit3 className="w-3.5 h-3.5 text-amber-700" /> };
+            case 'trah_delete':
+              return { label: 'Hapus Trah', cls: 'bg-rose-100 text-rose-800 border-rose-300', icon: <Trash2 className="w-3.5 h-3.5 text-rose-700" /> };
+            case 'member_add':
+              return { label: 'Tambah Anggota', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200', icon: <Plus className="w-3.5 h-3.5 text-emerald-700" /> };
+            case 'member_update':
+              return { label: 'Update Data', cls: 'bg-blue-50 text-blue-800 border-blue-200', icon: <Edit3 className="w-3.5 h-3.5 text-blue-700" /> };
+            case 'member_delete':
+              return { label: 'Hapus Anggota', cls: 'bg-rose-50 text-rose-800 border-rose-200', icon: <Trash2 className="w-3.5 h-3.5 text-rose-600" /> };
+            default:
+              return { label: 'Cadangan / Ekspor', cls: 'bg-stone-100 text-stone-700 border-stone-200', icon: <Database className="w-3.5 h-3.5 text-stone-600" /> };
+          }
+        };
+
+        const filteredLogs = activityLogs.filter((log) => {
+          if (logTrahFilter !== 'all' && log.trahId !== logTrahFilter) return false;
+          if (logCategoryFilter === 'claim_invite' && !['claim', 'unclaim', 'invite_join', 'invite_share'].includes(log.actionType)) return false;
+          if (logCategoryFilter === 'member' && !['member_add', 'member_update', 'member_delete'].includes(log.actionType)) return false;
+          if (logCategoryFilter === 'system' && !['trah_create', 'trah_update', 'trah_delete', 'backup'].includes(log.actionType)) return false;
+          if (logSearchQuery.trim()) {
+            const q = logSearchQuery.trim().toLowerCase();
+            const hay = `${log.actorName} ${log.actorEmail || ''} ${log.targetName || ''} ${log.summary} ${log.details || ''} ${log.trahName}`.toLowerCase();
+            if (!hay.includes(q)) return false;
+          }
+          return true;
+        });
+
+        return (
+          <div className="bg-white rounded-3xl border border-stone-200 p-4 sm:p-5 shadow-xs space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-100 pb-3">
+              <div>
+                <h4 className="font-black text-sm text-stone-900 flex items-center gap-1.5">
+                  <History className="w-4 h-4 text-emerald-700" />
+                  <span>Log Aktivitas Silsilah &amp; Klaim</span>
+                </h4>
+                <p className="text-[11px] text-stone-500">
+                  Pantau riwayat klaim anggota, gabung undangan, tambah/edit/hapus silsilah, serta cadangan data.
+                </p>
+              </div>
+              {activityLogs.length > 0 && (
+                !confirmClearLogs ? (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmClearLogs(true)}
+                    className="py-1.5 px-2.5 rounded-xl bg-stone-100 hover:bg-rose-50 text-stone-600 hover:text-rose-700 border border-stone-200 text-[11px] font-bold transition"
+                  >
+                    Bersihkan Log
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onClearActivityLogs();
+                        setConfirmClearLogs(false);
+                      }}
+                      className="py-1 px-2.5 rounded-lg bg-rose-600 text-white text-[10px] font-bold"
+                    >
+                      Ya, Hapus Semua
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmClearLogs(false)}
+                      className="py-1 px-2.5 rounded-lg bg-stone-200 text-stone-700 text-[10px] font-bold"
+                    >
+                      Batal
+                    </button>
+                  </div>
+                )
+              )}
+            </div>
+
+            {/* Filter Bar */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-stone-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={logSearchQuery}
+                  onChange={(e) => setLogSearchQuery(e.target.value)}
+                  placeholder="Cari nama, pelaku, atau aksi..."
+                  className="w-full pl-8 pr-3 py-1.5 text-xs bg-stone-50 border border-stone-200 rounded-xl focus:border-emerald-600 outline-hidden"
+                />
+              </div>
+
+              <select
+                value={logTrahFilter}
+                onChange={(e) => setLogTrahFilter(e.target.value)}
+                className="px-2.5 py-1.5 text-xs bg-stone-50 border border-stone-200 rounded-xl font-bold text-stone-700 outline-hidden"
+              >
+                <option value="all">Semua Trah ({activityLogs.length})</option>
+                {trahList.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+
+              <select
+                value={logCategoryFilter}
+                onChange={(e) => setLogCategoryFilter(e.target.value as 'all' | 'claim_invite' | 'member' | 'system')}
+                className="px-2.5 py-1.5 text-xs bg-stone-50 border border-stone-200 rounded-xl font-bold text-stone-700 outline-hidden"
+              >
+                <option value="all">Semua Jenis Aktivitas</option>
+                <option value="claim_invite">Klaim &amp; Undangan</option>
+                <option value="member">Tambah / Update / Hapus Anggota</option>
+                <option value="system">Trah &amp; Cadangan Data</option>
+              </select>
+            </div>
+
+            {/* Timeline Log */}
+            {filteredLogs.length === 0 ? (
+              <div className="p-6 rounded-2xl bg-stone-50 border border-dashed border-stone-300 text-center space-y-1">
+                <History className="w-7 h-7 text-stone-400 mx-auto" />
+                <p className="text-xs font-bold text-stone-700">Belum ada catatan aktivitas yang cocok</p>
+                <p className="text-[11px] text-stone-500">
+                  Setiap perubahan anggota, klaim profil, atau undangan trah akan otomatis tercatat di sini.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+                {filteredLogs.map((log) => {
+                  const meta = getActionMeta(log.actionType);
+                  const dateObj = new Date(log.createdAt);
+                  const formattedTime = Number.isNaN(dateObj.getTime())
+                    ? log.createdAt
+                    : dateObj.toLocaleString('id-ID', {
+                        day: '2-digit',
+                        month: 'short',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      });
+
+                  return (
+                    <div
+                      key={log.id}
+                      className="p-3 rounded-2xl border border-stone-200 bg-stone-50/70 hover:bg-white transition flex items-start gap-2.5"
+                    >
+                      <div className="w-8 h-8 rounded-xl bg-white border border-stone-200 flex items-center justify-center shrink-0 shadow-2xs mt-0.5">
+                        {meta.icon}
+                      </div>
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex flex-wrap items-center justify-between gap-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded border ${meta.cls}`}>
+                              {meta.label}
+                            </span>
+                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-white border border-stone-200 text-stone-700 truncate max-w-[170px]">
+                              {log.trahName}
+                            </span>
+                          </div>
+                          <span className="text-[10px] font-mono text-stone-400">{formattedTime}</span>
+                        </div>
+                        <p className="text-xs font-bold text-stone-900 leading-snug">{log.summary}</p>
+                        {log.details && (
+                          <p className="text-[11px] text-stone-600 leading-snug">{log.details}</p>
+                        )}
+                        <div className="text-[10px] text-stone-500 flex flex-wrap items-center gap-2">
+                          <span>Pelaku: <strong className="text-stone-700">{log.actorName}</strong></span>
+                          {log.actorEmail && <span className="font-mono">({log.actorEmail})</span>}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 };

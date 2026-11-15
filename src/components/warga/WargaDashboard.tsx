@@ -84,6 +84,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
   const [authAccount, setAuthAccount] = useState<AuthAccount | null>(() => AuthService.getAccount());
   const [rtProfile, setRtProfile] = useState<PaguyubanProfile>(() => RtSiagaStorage.getProfile());
   const [rtMember, setRtMember] = useState<WargaMember>(() => RtSiagaStorage.getCurrentMember());
+  const [hasRtCommunity, setHasRtCommunity] = useState<boolean>(() => RtSiagaStorage.hasCommunities());
   const [realBalance, setRealBalance] = useState<string>(() => getLiveKasMasukFormatted());
   const [unreadChatCount, setUnreadChatCount] = useState<number>(() => getLiveUnreadChatCount());
 
@@ -92,6 +93,7 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
       setAuthAccount(AuthService.getAccount());
       setRtProfile(RtSiagaStorage.getProfile());
       setRtMember(RtSiagaStorage.getCurrentMember());
+      setHasRtCommunity(RtSiagaStorage.hasCommunities());
       setRealBalance(getLiveKasMasukFormatted());
       setUnreadChatCount(getLiveUnreadChatCount());
     };
@@ -128,8 +130,8 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
                 <span className="text-2xl font-extrabold italic tracking-tight text-white leading-none">
                   warga<span className="text-[#5eead4] font-black drop-shadow-xs">Qu</span>
                 </span>
-                <span className="text-[10px] bg-emerald-950/40 border border-emerald-300/40 px-2 py-0.5 rounded-full font-bold text-[#5eead4]">
-                  RT 03
+                <span className="text-[10px] bg-emerald-950/40 border border-emerald-300/40 px-2 py-0.5 rounded-full font-bold text-[#5eead4] max-w-[110px] truncate">
+                  {hasRtCommunity ? rtProfile.orgName : 'Mandiri'}
                 </span>
               </div>
               <span className="text-[9px] text-emerald-200/90 font-medium tracking-wide flex items-center gap-1 mt-0.5">
@@ -198,16 +200,20 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
         {/* MAIN CARD WIDGET: TOTAL IURAN */}
         <div className="bg-white rounded-2xl p-4 shadow-sm border border-emerald-100/90 relative overflow-hidden">
           {/* Top ID Badge Row */}
-          <div className="flex justify-between items-center pb-3 border-b border-emerald-50">
-            <div className="inline-flex items-center gap-1.5 bg-emerald-50 text-emerald-800 px-2.5 py-1 rounded-lg text-xs font-semibold border border-emerald-200/60">
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-              <span>
-                {rtMember.siagaStatus === 'active'
+          <div className="flex justify-between items-center pb-3 border-b border-emerald-50 gap-2">
+            <div className="inline-flex items-center gap-1.5 bg-emerald-50 text-emerald-800 px-2.5 py-1 rounded-lg text-xs font-semibold border border-emerald-200/60 min-w-0">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+              <span className="truncate">
+                {!hasRtCommunity
+                  ? 'Belum Gabung RT / Komunitas'
+                  : rtMember.siagaStatus === 'active'
                   ? `SIAGA AKTIF: ${rtProfile.orgName}`
-                  : `RT: ${rtProfile.orgName}`}
+                  : `${rtProfile.orgType}: ${rtProfile.orgName}`}
               </span>
             </div>
-            <span className="text-xs text-slate-500 font-medium">{rtMember.block}</span>
+            <span className="text-xs text-slate-500 font-medium truncate">
+              {hasRtCommunity ? rtMember.block : 'Khusus Undangan / Buat Baru'}
+            </span>
           </div>
 
           {/* Primary Metric Display */}
@@ -239,11 +245,15 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
           {/* Card Footer Link */}
           <div className="pt-2 border-t border-emerald-50 flex justify-between items-center text-xs font-semibold text-emerald-700">
             <button
-              onClick={() => onOpenRtQu('iuran')}
+              onClick={() => onOpenRtQu(hasRtCommunity ? 'iuran' : 'ringkasan')}
               className="flex items-center gap-1.5 hover:text-emerald-800 hover:underline active:opacity-80"
             >
               <Receipt className="w-4 h-4 text-emerald-600" />
-              <span>Lihat Riwayat Pembayaran</span>
+              <span>
+                {hasRtCommunity
+                  ? 'Lihat Riwayat Pembayaran'
+                  : 'Gabung Undangan atau Buat Komunitas RTQu'}
+              </span>
             </button>
             <ChevronRight className="w-4 h-4 text-emerald-500" />
           </div>

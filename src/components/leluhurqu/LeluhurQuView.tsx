@@ -56,12 +56,14 @@ import {
   Compass,
   Settings,
   BookOpen,
+  History,
 } from 'lucide-react';
 import { InteractiveGridCanvasView } from './InteractiveGridCanvasView';
 import {
   LeluhurSettingsView,
   LeluhurAccountProfile,
   LeluhurAppPreferences,
+  SettingsSectionTab,
 } from './LeluhurSettingsView';
 import { AUTH_SYNC_EVENT, AuthService } from '../../services/authService';
 import { LeluhurBookModal } from './LeluhurBookModal';
@@ -92,9 +94,38 @@ export interface FamilyMember {
   generationLevel: number;
   orderIndex?: number;
   spouses?: SpouseInfo[];
+  claimedByEmail?: string;
+  claimedByName?: string;
+  claimedAt?: string;
 }
 
 export type LineageSide = 'ayah_user' | 'ibu_user' | 'ayah_pasangan' | 'ibu_pasangan' | 'umum';
+
+export type LeluhurLogActionType =
+  | 'claim'
+  | 'unclaim'
+  | 'invite_join'
+  | 'invite_share'
+  | 'trah_create'
+  | 'trah_update'
+  | 'trah_delete'
+  | 'member_add'
+  | 'member_update'
+  | 'member_delete'
+  | 'backup';
+
+export interface LeluhurActivityLog {
+  id: string;
+  trahId: string;
+  trahName: string;
+  actionType: LeluhurLogActionType;
+  actorName: string;
+  actorEmail?: string;
+  targetName?: string;
+  summary: string;
+  details?: string;
+  createdAt: string;
+}
 
 export interface TrahCategory {
   id: string;
@@ -150,6 +181,7 @@ const STORAGE_KEYS = [
 const ACTIVE_STORAGE_KEY = 'wargaqu_leluhur_trah_v4';
 const TRAH_POSTS_STORAGE_KEY = 'wargaqu_leluhur_posts_v1';
 const PENDING_INVITE_KEY = 'wargaqu_pending_trah_invite_v1';
+const CARRYOVER_INVITE_KEY = 'wargaqu_carryover_trah_invite_v1';
 const OWNER_EMAILS = ['usahaqu2026@gmail.com', 'usahaqu26@gmail.com'];
 
 const PHOTO_SHAPE_KEY = 'wargaqu_leluhur_photo_shape';
@@ -180,81 +212,265 @@ function getScopedPostsStorageKey(scopeKey: string): string {
   return `wargaqu_leluhur_posts_v2_${scopeKey}`;
 }
 
+function getScopedLogsStorageKey(scopeKey: string): string {
+  return `wargaqu_leluhur_logs_v1_${scopeKey}`;
+}
+
+function loadActivityLogsForScope(scopeKey: string): LeluhurActivityLog[] {
+  try {
+    const raw = localStorage.getItem(getScopedLogsStorageKey(scopeKey));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+function toBase64Url(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function fromBase64Url(b64u: string): Uint8Array<ArrayBuffer> {
+  const norm = b64u.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = norm.length % 4 === 0 ? '' : '='.repeat(4 - (norm.length % 4));
+  const bin = atob(norm + pad);
+  const bytes = new Uint8Array(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return bytes;
+}
+
+type CompactMemberTuple = [
+  string, // id
+  string, // name
+  'L' | 'P', // gender
+  number, // parent index in array (-1 if root)
+  number, // generationLevel
+  number, // orderIndex
+  number, // isDeceased (0/1)
+  string?, // callName
+  string?, // birthYear
+  string?, // deathYear
+  Array<[string, number]>? // spouses [name, statusIdx 0=menikah,1=cerai_hidup,2=cerai_mati]
+];
+
+const SPOUSE_STATUS_LIST: Array<'menikah' | 'cerai_hidup' | 'cerai_mati'> = [
+  'menikah',
+  'cerai_hidup',
+  'cerai_mati',
+];
+
+function stripPhotosForInvite(members: FamilyMember[]): FamilyMember[] {
+  return (members || []).map((m) => ({
+    ...m,
+    photoUrl: undefined,
+  }));
+}
+
 function encodeTrahInviteToken(trah: TrahCategory, inviterName: string): string {
   const compactPayload = {
     v: 1,
     inviter: inviterName || 'Keluarga',
-    invitedAt: new Date().toISOString(),
     trah: {
       id: trah.id,
       name: trah.name,
       description: trah.description,
       lineageSide: trah.lineageSide || 'umum',
-      members: trah.members || [],
+      members: stripPhotosForInvite(trah.members || []),
     },
   };
-  const json = JSON.stringify(compactPayload);
-  const bytes = new TextEncoder().encode(json);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) {
-    bin += String.fromCharCode(bytes[i]);
-  }
-  return `LQH1:${btoa(bin)}`;
+  const bytes = new TextEncoder().encode(JSON.stringify(compactPayload));
+  return `LQH1:${toBase64Url(bytes)}`;
 }
 
-function decodeTrahInviteInput(
-  rawInput: string
-): { trah: TrahCategory; inviter: string } | null {
-  const trimmed = (rawInput || '').trim();
-  if (!trimmed) return null;
+async function encodeTrahInviteTokenCompact(
+  trah: TrahCategory,
+  inviterName: string
+): Promise<string> {
+  const members = trah.members || [];
+  const idxById = new Map<string, number>();
+  members.forEach((m, i) => idxById.set(m.id, i));
 
-  let token = trimmed;
-  if (trimmed.includes('trahInvite=')) {
+  const tuples: CompactMemberTuple[] = members.map((m) => {
+    const pIdx = m.parentId && idxById.has(m.parentId) ? idxById.get(m.parentId)! : -1;
+    const spList =
+      m.spouses && m.spouses.length > 0
+        ? m.spouses.map((sp): [string, number] => [
+            sp.name,
+            Math.max(0, SPOUSE_STATUS_LIST.indexOf(sp.status)),
+          ])
+        : undefined;
+    const tuple: CompactMemberTuple = [
+      m.id,
+      m.name,
+      m.gender,
+      pIdx,
+      m.generationLevel ?? 0,
+      m.orderIndex ?? 1,
+      m.isDeceased ? 1 : 0,
+    ];
+    if (m.callName || m.birthYear || m.deathYear || spList) {
+      tuple.push(m.callName || '');
+      tuple.push(m.birthYear || '');
+      tuple.push(m.deathYear || '');
+      if (spList) tuple.push(spList);
+    }
+    return tuple;
+  });
+
+  const packed = [
+    2,
+    inviterName || 'Keluarga',
+    trah.id,
+    trah.name,
+    trah.description || '',
+    trah.lineageSide || 'umum',
+    tuples,
+  ];
+  const rawBytes = new TextEncoder().encode(JSON.stringify(packed));
+
+  try {
+    if (typeof CompressionStream !== 'undefined') {
+      const cs = new CompressionStream('deflate-raw');
+      const writer = cs.writable.getWriter();
+      writer.write(rawBytes);
+      writer.close();
+      const compressedBuf = await new Response(cs.readable).arrayBuffer();
+      return `LQH2_${toBase64Url(new Uint8Array(compressedBuf))}`;
+    }
+  } catch {
+    // fallback below
+  }
+
+  return encodeTrahInviteToken(trah, inviterName);
+}
+
+function extractRawTokenFromInput(rawInput: string): string {
+  const trimmed = (rawInput || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.includes('t=') || trimmed.includes('trah=') || trimmed.includes('trahInvite=')) {
     try {
-      const idx = trimmed.indexOf('?');
-      const searchStr = idx >= 0 ? trimmed.slice(idx) : `?${trimmed}`;
-      const params = new URLSearchParams(searchStr);
-      const extracted = params.get('trahInvite');
-      if (extracted) token = extracted.trim();
+      const qIdx = trimmed.indexOf('?');
+      const hIdx = trimmed.indexOf('#');
+      const sliceFrom = qIdx >= 0 ? trimmed.slice(qIdx) : hIdx >= 0 ? `?${trimmed.slice(hIdx + 1)}` : `?${trimmed}`;
+      const params = new URLSearchParams(sliceFrom.split('#')[0]);
+      const extracted = params.get('t') || params.get('trah') || params.get('trahInvite');
+      if (extracted) return extracted.trim();
+      if (trimmed.includes('t=')) {
+        const afterT = trimmed.split('t=')[1]?.split('&')[0]?.split('#')[0];
+        if (afterT) return decodeURIComponent(afterT).trim();
+      }
     } catch {
       // keep raw
     }
   }
+  return trimmed;
+}
+
+async function decodeTrahInviteInputAsync(
+  rawInput: string
+): Promise<{ trah: TrahCategory; inviter: string } | null> {
+  const token = extractRawTokenFromInput(rawInput);
+  if (!token) return null;
+
+  if (token.startsWith('LQH2_')) {
+    try {
+      const compressedBytes = fromBase64Url(token.slice(5));
+      if (typeof DecompressionStream === 'undefined') return null;
+      const ds = new DecompressionStream('deflate-raw');
+      const writer = ds.writable.getWriter();
+      writer.write(compressedBytes);
+      writer.close();
+      const decompressedBuf = await new Response(ds.readable).arrayBuffer();
+      const json = new TextDecoder().decode(new Uint8Array(decompressedBuf));
+      const arr = JSON.parse(json) as [
+        number,
+        string,
+        string,
+        string,
+        string,
+        LineageSide,
+        CompactMemberTuple[]
+      ];
+      if (!Array.isArray(arr) || arr.length < 7) return null;
+      const [, inviter, trahId, trahName, trahDesc, lineageSide, tuples] = arr;
+      if (!trahId || !trahName || !Array.isArray(tuples)) return null;
+
+      const members: FamilyMember[] = tuples.map((tp) => {
+        const pIdx = tp[3];
+        const parentId = pIdx >= 0 && tuples[pIdx] ? tuples[pIdx][0] : null;
+        const spTuples = tp[10] || [];
+        const spouses: SpouseInfo[] = spTuples.map((sp, spIdx) => ({
+          id: `sp_${tp[0]}_${spIdx + 1}`,
+          name: sp[0],
+          orderIndex: spIdx + 1,
+          status: SPOUSE_STATUS_LIST[sp[1]] || 'menikah',
+        }));
+        return {
+          id: tp[0],
+          name: tp[1],
+          gender: tp[2] === 'P' ? 'P' : 'L',
+          parentId,
+          generationLevel: tp[4] ?? 0,
+          orderIndex: tp[5] ?? 1,
+          isDeceased: tp[6] === 1,
+          callName: tp[7] || undefined,
+          birthYear: tp[8] || undefined,
+          deathYear: tp[9] || undefined,
+          spouses,
+        };
+      });
+
+      return {
+        inviter: inviter || 'Keluarga',
+        trah: {
+          id: trahId,
+          name: trahName,
+          description: trahDesc || 'Trah Undangan Keluarga',
+          lineageSide: lineageSide || 'umum',
+          members,
+        },
+      };
+    } catch {
+      return null;
+    }
+  }
 
   if (token.startsWith('LQH1:')) {
-    token = token.slice(5);
-  } else {
-    return null;
+    try {
+      const bytes = fromBase64Url(token.slice(5));
+      const json = new TextDecoder().decode(bytes);
+      const parsed = JSON.parse(json) as {
+        v?: number;
+        inviter?: string;
+        trah?: Partial<TrahCategory>;
+      };
+      if (!parsed.trah || !parsed.trah.id || !parsed.trah.name) return null;
+      const rawMembers = Array.isArray(parsed.trah.members) ? parsed.trah.members : [];
+      return {
+        inviter: parsed.inviter || 'Keluarga',
+        trah: {
+          id: parsed.trah.id,
+          name: parsed.trah.name,
+          description: parsed.trah.description || 'Trah Undangan Keluarga',
+          lineageSide: parsed.trah.lineageSide || 'umum',
+          members: rawMembers,
+        },
+      };
+    } catch {
+      return null;
+    }
   }
 
-  try {
-    const bin = atob(token);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) {
-      bytes[i] = bin.charCodeAt(i);
-    }
-    const json = new TextDecoder().decode(bytes);
-    const parsed = JSON.parse(json) as {
-      v?: number;
-      inviter?: string;
-      trah?: Partial<TrahCategory>;
-    };
-    if (!parsed.trah || !parsed.trah.id || !parsed.trah.name) return null;
-    const rawMembers = Array.isArray(parsed.trah.members) ? parsed.trah.members : [];
-    const trah: TrahCategory = {
-      id: parsed.trah.id,
-      name: parsed.trah.name,
-      description: parsed.trah.description || 'Trah Undangan Keluarga',
-      lineageSide: parsed.trah.lineageSide || 'umum',
-      members: rawMembers,
-    };
-    return {
-      trah,
-      inviter: parsed.inviter || 'Keluarga',
-    };
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 const DEFAULT_ACCOUNT_PROFILE: LeluhurAccountProfile = {
@@ -1279,6 +1495,22 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
   // Modal Undangan Silsilah Trah Medsos (WA / ChatQu / Salin Link)
   const [isInviteModalOpen, setIsInviteModalOpen] = useState<boolean>(false);
   const [inviteTrahTarget, setInviteTrahTarget] = useState<TrahCategory | null>(null);
+  const [compactInviteToken, setCompactInviteToken] = useState<string>('');
+  const [autoJoinedBanner, setAutoJoinedBanner] = useState<{
+    trahId: string;
+    trahName: string;
+    inviter: string;
+    memberCount: number;
+  } | null>(null);
+
+  // Log Aktivitas & Navigasi langsung ke Tab Pengaturan
+  const [activityLogs, setActivityLogs] = useState<LeluhurActivityLog[]>(() =>
+    loadActivityLogsForScope(accountScope.scopeKey)
+  );
+  const [settingsSectionTrigger, setSettingsSectionTrigger] = useState<{
+    tab: SettingsSectionTab;
+    key: number;
+  }>({ tab: 'account', key: 0 });
 
   // Modal Tautkan Trah Pasangan (4 Pilar: Ayah User, Ibu User, Ayah Pasangan, Ibu Pasangan)
   const [isSpouseModalOpen, setIsSpouseModalOpen] = useState<boolean>(false);
@@ -1291,6 +1523,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
 
   const activeTrahStorageKey = getScopedTrahStorageKey(accountScope.scopeKey);
   const activePostsStorageKey = getScopedPostsStorageKey(accountScope.scopeKey);
+  const activeLogsStorageKey = getScopedLogsStorageKey(accountScope.scopeKey);
 
   // Simpan data & preferensi otomatis per-akun
   useEffect(() => {
@@ -1317,11 +1550,135 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
 
   useEffect(() => {
     try {
+      localStorage.setItem(activeLogsStorageKey, JSON.stringify(activityLogs));
+    } catch (e) {
+      console.warn('Gagal menyimpan log aktivitas', e);
+    }
+  }, [activityLogs, activeLogsStorageKey]);
+
+  useEffect(() => {
+    try {
       localStorage.setItem(ACCOUNT_PROFILE_KEY, JSON.stringify(accountProfile));
     } catch (e) {
       console.warn('Gagal menyimpan profil akun', e);
     }
   }, [accountProfile]);
+
+  const appendActivityLog = (entry: {
+    trahId: string;
+    trahName: string;
+    actionType: LeluhurLogActionType;
+    summary: string;
+    targetName?: string;
+    details?: string;
+  }) => {
+    const newLog: LeluhurActivityLog = {
+      id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      trahId: entry.trahId,
+      trahName: entry.trahName,
+      actionType: entry.actionType,
+      actorName: accountProfile.displayName || accountProfile.fullName || 'Pengguna',
+      actorEmail: accountScope.email || accountProfile.email || undefined,
+      targetName: entry.targetName,
+      summary: entry.summary,
+      details: entry.details,
+      createdAt: new Date().toISOString(),
+    };
+    setActivityLogs((prev) => [newLog, ...prev].slice(0, 250));
+  };
+
+  const openSettingsTab = (tab: SettingsSectionTab) => {
+    setSettingsSectionTrigger((prev) => ({ tab, key: prev.key + 1 }));
+    setViewMode('settings');
+  };
+
+  const handleClaimMember = (member: FamilyMember) => {
+    const claimerName = accountProfile.displayName || accountProfile.fullName || 'Anggota Keluarga';
+    const claimerEmail = accountScope.email || accountProfile.email || `akun-${accountScope.scopeKey}`;
+    const claimedAt = new Date().toISOString();
+
+    setTrahList((prev) =>
+      prev.map((t) =>
+        t.id === activeTrah.id
+          ? {
+              ...t,
+              members: t.members.map((m) =>
+                m.id === member.id
+                  ? {
+                      ...m,
+                      claimedByEmail: claimerEmail,
+                      claimedByName: claimerName,
+                      claimedAt,
+                    }
+                  : m
+              ),
+            }
+          : t
+      )
+    );
+
+    if (selectedMember?.id === member.id) {
+      setSelectedMember({
+        ...member,
+        claimedByEmail: claimerEmail,
+        claimedByName: claimerName,
+        claimedAt,
+      });
+    }
+
+    appendActivityLog({
+      trahId: activeTrah.id,
+      trahName: activeTrah.name,
+      actionType: 'claim',
+      targetName: member.name,
+      summary: `${claimerName} mengklaim profil "${member.name}" sebagai dirinya`,
+      details: `Terverifikasi atas akun ${claimerEmail}`,
+    });
+
+    showNotification(`Profil "${member.name}" berhasil diklaim atas nama ${claimerName}! ✅`);
+  };
+
+  const handleUnclaimMember = (member: FamilyMember) => {
+    setTrahList((prev) =>
+      prev.map((t) =>
+        t.id === activeTrah.id
+          ? {
+              ...t,
+              members: t.members.map((m) =>
+                m.id === member.id
+                  ? {
+                      ...m,
+                      claimedByEmail: undefined,
+                      claimedByName: undefined,
+                      claimedAt: undefined,
+                    }
+                  : m
+              ),
+            }
+          : t
+      )
+    );
+
+    if (selectedMember?.id === member.id) {
+      setSelectedMember({
+        ...member,
+        claimedByEmail: undefined,
+        claimedByName: undefined,
+        claimedAt: undefined,
+      });
+    }
+
+    appendActivityLog({
+      trahId: activeTrah.id,
+      trahName: activeTrah.name,
+      actionType: 'unclaim',
+      targetName: member.name,
+      summary: `Klaim profil "${member.name}" dilepaskan`,
+      details: `Sebelumnya diklaim oleh ${member.claimedByName || member.claimedByEmail || 'pengguna'}.`,
+    });
+
+    showNotification(`Klaim pada profil "${member.name}" telah dilepas.`);
+  };
 
   useEffect(() => {
     const syncFromAuth = () => {
@@ -1330,8 +1687,10 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
         if (prevScope.scopeKey !== nextScope.scopeKey) {
           const nextTrahs = loadTrahListForScope(nextScope);
           const nextPosts = loadPostsForScope(nextScope);
+          const nextLogs = loadActivityLogsForScope(nextScope.scopeKey);
           setTrahList(nextTrahs);
           setTrahPosts(nextPosts);
+          setActivityLogs(nextLogs);
           setActiveTrahId(nextTrahs[0]?.id || '');
           setFeedPillarFilter('all');
         }
@@ -1360,8 +1719,11 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     return () => window.removeEventListener(AUTH_SYNC_EVENT, syncFromAuth);
   }, []);
 
-  const handleAcceptTrahInvite = (rawTokenOrUrl: string): boolean => {
-    const decoded = decodeTrahInviteInput(rawTokenOrUrl);
+  const handleAcceptTrahInvite = async (
+    rawTokenOrUrl: string,
+    autoFromLink = false
+  ): Promise<boolean> => {
+    const decoded = await decodeTrahInviteInputAsync(rawTokenOrUrl);
     if (!decoded) {
       showNotification('Kode atau link undangan Trah tidak valid.');
       return false;
@@ -1373,34 +1735,99 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       members: normalizeTrahMembers(rawInvited.members || [], false).members,
     };
 
+    const targetScope = getCurrentAccountScope();
+    const targetKey = getScopedTrahStorageKey(targetScope.scopeKey);
+
     setTrahList((prev) => {
       const existsIdx = prev.findIndex((t) => t.id === normalizedInvited.id);
-      if (existsIdx !== -1) {
-        return prev.map((t, i) => (i === existsIdx ? normalizedInvited : t));
+      const nextList =
+        existsIdx !== -1
+          ? prev.map((t, i) => (i === existsIdx ? normalizedInvited : t))
+          : [normalizedInvited, ...prev];
+      try {
+        localStorage.setItem(targetKey, JSON.stringify(nextList));
+      } catch {
+        // ignore
       }
-      return [normalizedInvited, ...prev];
+      return nextList;
     });
     setActiveTrahId(normalizedInvited.id);
     setInviteJoinInput('');
     setViewMode('grid');
+    if (autoFromLink) {
+      setAutoJoinedBanner({
+        trahId: normalizedInvited.id,
+        trahName: normalizedInvited.name,
+        inviter,
+        memberCount: normalizedInvited.members.length,
+      });
+    }
+
+    if (targetScope.scopeKey === 'guest') {
+      try {
+        sessionStorage.setItem(CARRYOVER_INVITE_KEY, rawTokenOrUrl);
+      } catch {
+        // ignore
+      }
+    }
+
+    appendActivityLog({
+      trahId: normalizedInvited.id,
+      trahName: normalizedInvited.name,
+      actionType: 'invite_join',
+      targetName: normalizedInvited.name,
+      summary: `Otomatis masuk ke Trah "${normalizedInvited.name}" via undangan ${inviter}`,
+      details: `${normalizedInvited.members.length} anggota silsilah dimuat ke akun ${targetScope.email || 'tamu'}.`,
+    });
+
     showNotification(
-      `Undangan diterima! Trah "${normalizedInvited.name}" dari ${inviter} (${normalizedInvited.members.length} anggota) dibuka.`
+      `Otomatis masuk Trah "${normalizedInvited.name}" dari ${inviter} (${normalizedInvited.members.length} anggota)!`
     );
     return true;
   };
 
-  // Proses otomatis undangan Trah yang masuk lewat URL (?trahInvite=...)
+  // Proses otomatis undangan Trah yang masuk lewat URL (?t=... / ?trahInvite=...)
   useEffect(() => {
-    try {
-      const pending = localStorage.getItem(PENDING_INVITE_KEY);
-      if (pending && pending.trim()) {
-        localStorage.removeItem(PENDING_INVITE_KEY);
-        handleAcceptTrahInvite(pending);
+    const checkAndProcessInvite = async () => {
+      try {
+        const pending = localStorage.getItem(PENDING_INVITE_KEY);
+        if (pending && pending.trim()) {
+          localStorage.removeItem(PENDING_INVITE_KEY);
+          await handleAcceptTrahInvite(pending, true);
+          return;
+        }
+        // Jika baru saja login setelah klik link undangan saat masih Guest, bawa otomatis Trah undangan ke akun baru
+        if (accountScope.scopeKey !== 'guest') {
+          const carryover = sessionStorage.getItem(CARRYOVER_INVITE_KEY);
+          if (carryover && carryover.trim()) {
+            sessionStorage.removeItem(CARRYOVER_INVITE_KEY);
+            await handleAcceptTrahInvite(carryover, true);
+          }
+        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
-    }
+    };
+
+    checkAndProcessInvite();
+    window.addEventListener('wargaqu-trah-invite-arrived', checkAndProcessInvite);
+    return () => window.removeEventListener('wargaqu-trah-invite-arrived', checkAndProcessInvite);
   }, [accountScope.scopeKey]);
+
+  // Hasilkan token undangan ringkas (?t=LQH2_...) saat modal undangan dibuka
+  useEffect(() => {
+    if (!isInviteModalOpen || trahList.length === 0) return;
+    let cancelled = false;
+    const target = inviteTrahTarget || activeTrah;
+    encodeTrahInviteTokenCompact(target, accountProfile.displayName || 'Keluarga').then(
+      (tok) => {
+        if (!cancelled) setCompactInviteToken(tok);
+      }
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [isInviteModalOpen, inviteTrahTarget, trahList, accountProfile.displayName]);
 
   useEffect(() => {
     try {
@@ -1557,6 +1984,13 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     setQuickParentId(newRoot.id);
     setQuickShowAddParent(false);
     setQuickNewRootName('');
+    appendActivityLog({
+      trahId: activeTrah.id,
+      trahName: activeTrah.name,
+      actionType: 'member_add',
+      targetName: newRoot.name,
+      summary: `Membuat Leluhur Utama "${newRoot.name}" di ${activeTrah.name}`,
+    });
     showNotification(`Ayah/Leluhur Utama "${newRoot.name}" berhasil dibuat! Silakan isi anak.`);
   };
 
@@ -1711,6 +2145,18 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
 
     setQuickCommaInput('');
     setQuickBatchMode('append');
+
+    appendActivityLog({
+      trahId: currentTrah.id,
+      trahName: currentTrah.name,
+      actionType: quickBatchMode === 'replace' ? 'member_update' : 'member_add',
+      targetName: parent.name,
+      summary:
+        quickBatchMode === 'replace'
+          ? `Memperbarui daftar ${parsedList.length} anak untuk ${parent.name}`
+          : `Menambahkan ${parsedList.length} anak baru untuk ${parent.name}`,
+      details: parsedList.map((p) => p.name).join(', '),
+    });
 
     if (closeModal) {
       setIsQuickBatchOpen(false);
@@ -1876,6 +2322,13 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
         )
       );
       showNotification(`Uyut / Leluhur Utama "${newMember.name}" berhasil ditambahkan.`);
+      appendActivityLog({
+        trahId: activeTrah.id,
+        trahName: activeTrah.name,
+        actionType: 'member_add',
+        targetName: newMember.name,
+        summary: `Menambah Leluhur Utama "${newMember.name}"`,
+      });
     } else if (formMode === 'add_child') {
       const parent = activeTrah.members.find((m) => m.id === formParentId);
       const parentGen = parent ? parent.generationLevel : 0;
@@ -1904,6 +2357,13 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
         )
       );
       showNotification(`Anak/Keturunan "${newMember.name}" berhasil ditambahkan.`);
+      appendActivityLog({
+        trahId: activeTrah.id,
+        trahName: activeTrah.name,
+        actionType: 'member_add',
+        targetName: newMember.name,
+        summary: `Menambah anggota "${newMember.name}"${parent ? ` (anak dari ${parent.name})` : ''}`,
+      });
     } else if (formMode === 'edit') {
       const isSanta =
         activeTrah.id === 'trah-ayah-user' ||
@@ -1937,6 +2397,14 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
         })
       );
       showNotification(`Data silsilah & garis nasab "${nameInput.trim()}" berhasil diperbarui.`);
+      appendActivityLog({
+        trahId: activeTrah.id,
+        trahName: activeTrah.name,
+        actionType: 'member_update',
+        targetName: nameInput.trim(),
+        summary: `Memperbarui biodata / pasangan / nasab "${nameInput.trim()}"`,
+        details: cleanSpouses.length > 0 ? `${cleanSpouses.length} pasangan tercatat` : undefined,
+      });
     }
 
     setIsFormModalOpen(false);
@@ -1953,6 +2421,12 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     );
 
     if (repairedCount > 0) {
+      appendActivityLog({
+        trahId: activeTrah.id,
+        trahName: activeTrah.name,
+        actionType: 'member_update',
+        summary: `Merapikan & menyambungkan ${repairedCount} tautan garis nasab`,
+      });
       showNotification(`Berhasil merapikan & menyambungkan ${repairedCount} tautan garis nasab pada ${activeTrah.name}! ✨`);
     } else {
       showNotification(`Susunan garis nasab ${activeTrah.name} sudah rapi & sinkron.`);
@@ -1992,6 +2466,14 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       setIsDetailModalOpen(false);
       setSelectedMember(null);
     }
+
+    appendActivityLog({
+      trahId: activeTrah.id,
+      trahName: activeTrah.name,
+      actionType: 'member_delete',
+      targetName: member.name,
+      summary: `Menghapus "${member.name}" beserta cabang (${toDeleteIds.size} anggota)`,
+    });
 
     showNotification(`${toDeleteIds.size} anggota silsilah berhasil dihapus.`);
   };
@@ -2108,6 +2590,15 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     setNewTrahChildrenInput('');
     setNewTrahCreateIntroPost(true);
     setNewTrahTargetView('grid');
+
+    appendActivityLog({
+      trahId: newTrah.id,
+      trahName: newTrah.name,
+      actionType: 'trah_create',
+      targetName: newTrah.name,
+      summary: `Membuat Trah modular baru "${newTrah.name}"`,
+      details: `${initialMembers.length} anggota awal tercatat.`,
+    });
 
     showNotification(
       initialMembers.length > 0
@@ -2315,6 +2806,13 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     } catch (err) {
       console.warn(err);
     }
+    appendActivityLog({
+      trahId: activeTrah.id,
+      trahName: activeTrah.name,
+      actionType: 'trah_update',
+      targetName: activeTrah.name,
+      summary: `Memindahkan "${activeTrah.name}" ke Pilar Trah Ayah`,
+    });
     showNotification(`Trah "${activeTrah.name}" berhasil dipindahkan ke Pilar Trah Ayah! 👨✨`);
   };
 
@@ -2322,6 +2820,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     trahId: string,
     updates: Partial<Pick<TrahCategory, 'name' | 'description' | 'lineageSide'>>
   ) => {
+    const targetBefore = trahList.find((t) => t.id === trahId);
     setTrahList((prev) =>
       prev.map((t) => (t.id === trahId ? { ...t, ...updates } : t))
     );
@@ -2338,6 +2837,15 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
         )
       );
     }
+    if (targetBefore) {
+      appendActivityLog({
+        trahId,
+        trahName: updates.name ?? targetBefore.name,
+        actionType: 'trah_update',
+        targetName: updates.name ?? targetBefore.name,
+        summary: `Memperbarui info Trah "${updates.name ?? targetBefore.name}"`,
+      });
+    }
   };
 
   const handleDeleteTrah = (trahId: string) => {
@@ -2349,6 +2857,15 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     }
     if (feedPillarFilter === trahId) {
       setFeedPillarFilter('all');
+    }
+    if (target) {
+      appendActivityLog({
+        trahId,
+        trahName: target.name,
+        actionType: 'trah_delete',
+        targetName: target.name,
+        summary: `Menghapus Trah "${target.name}" (${target.members.length} anggota)`,
+      });
     }
     showNotification(`Trah "${target?.name || ''}" berhasil dihapus.`);
   };
@@ -2390,6 +2907,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       appPreferences,
       trahList,
       trahPosts,
+      activityLogs,
       gridDesignsMap,
     };
 
@@ -2406,6 +2924,12 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
+      appendActivityLog({
+        trahId: activeTrah.id || 'all',
+        trahName: activeTrah.name || 'Semua Trah',
+        actionType: 'backup',
+        summary: `Mengekspor cadangan lengkap JSON (${trahList.length} Trah)`,
+      });
       showNotification('File cadangan lengkap (.json) berhasil diunduh!');
     };
 
@@ -2447,6 +2971,9 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       if (Array.isArray(parsed.trahPosts)) {
         setTrahPosts(parsed.trahPosts);
       }
+      if (Array.isArray(parsed.activityLogs)) {
+        setActivityLogs(parsed.activityLogs);
+      }
       if (parsed.accountProfile && typeof parsed.accountProfile === 'object') {
         setAccountProfile({ ...DEFAULT_ACCOUNT_PROFILE, ...parsed.accountProfile });
       }
@@ -2465,6 +2992,12 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
         });
       }
 
+      appendActivityLog({
+        trahId: normalizedImported[0].id,
+        trahName: normalizedImported[0].name,
+        actionType: 'backup',
+        summary: `Memulihkan cadangan JSON (${parsed.trahList.length} Trah)`,
+      });
       showNotification(`Berhasil memulihkan ${parsed.trahList.length} Trah dari file cadangan!`);
     } catch {
       showNotification('Gagal membaca file cadangan JSON. Pastikan file tidak rusak.');
@@ -2537,6 +3070,12 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
+      appendActivityLog({
+        trahId: activeTrah.id,
+        trahName: activeTrah.name,
+        actionType: 'backup',
+        summary: `Mengekspor Excel CSV "${activeTrah.name}" (${activeTrah.members.length} anggota)`,
+      });
       showNotification('File CSV Excel berhasil diunduh!');
     };
 
@@ -2815,18 +3354,84 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
           )}
         </div>
 
-        {(viewMode === 'grid' || viewMode === 'excel') && trahList.length > 0 && (
-          <button
-            type="button"
-            onClick={() => setIsBookModalOpen(true)}
-            className="px-2.5 py-1 rounded-lg bg-emerald-800 hover:bg-emerald-700 text-white text-[11px] font-extrabold flex items-center gap-1.5 shadow-2xs transition active:scale-95 whitespace-nowrap shrink-0"
-            title="Pratinjau & Unduh Buku Leluhur (A4 / A5 / A6 PDF)"
-          >
-            <BookOpen className="w-3.5 h-3.5 text-amber-300" />
-            <span>Buku Leluhur (PDF)</span>
-          </button>
-        )}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {viewMode !== 'settings' && (
+            <button
+              type="button"
+              onClick={() => openSettingsTab('logs')}
+              className="px-2.5 py-1 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-800 border border-stone-300 text-[11px] font-bold flex items-center gap-1.5 transition active:scale-95 whitespace-nowrap"
+              title="Pantau riwayat perubahan data, klaim anggota & undangan"
+            >
+              <History className="w-3.5 h-3.5 text-emerald-700" />
+              <span className="hidden sm:inline">Log Aktivitas</span>
+              {activityLogs.length > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full bg-emerald-700 text-white text-[9px] font-extrabold">
+                  {activityLogs.length}
+                </span>
+              )}
+            </button>
+          )}
+
+          {(viewMode === 'grid' || viewMode === 'excel') && trahList.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setIsBookModalOpen(true)}
+              className="px-2.5 py-1 rounded-lg bg-emerald-800 hover:bg-emerald-700 text-white text-[11px] font-extrabold flex items-center gap-1.5 shadow-2xs transition active:scale-95 whitespace-nowrap shrink-0"
+              title="Pratinjau & Unduh Buku Leluhur (A4 / A5 / A6 PDF)"
+            >
+              <BookOpen className="w-3.5 h-3.5 text-amber-300" />
+              <span>Buku Leluhur (PDF)</span>
+            </button>
+          )}
+        </div>
       </div>
+
+      {/* ========================================================= */}
+      {/* BANNER SELAMAT DATANG AUTO-MASUK VIA LINK UNDANGAN        */}
+      {/* ========================================================= */}
+      {autoJoinedBanner && trahList.length > 0 && (
+        <div className="bg-gradient-to-r from-emerald-800 to-teal-800 text-white px-3 py-2 border-b border-emerald-950 flex flex-wrap items-center justify-between gap-2 text-xs z-20 shrink-0 shadow-xs">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-7 h-7 rounded-lg bg-amber-400 text-stone-950 flex items-center justify-center shrink-0">
+              <UserCheck className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <p className="font-extrabold text-xs truncate">
+                Otomatis masuk ke Trah &ldquo;{autoJoinedBanner.trahName}&rdquo;
+              </p>
+              <p className="text-[10px] text-emerald-100 truncate">
+                Undangan dari {autoJoinedBanner.inviter} • {autoJoinedBanner.memberCount} anggota silsilah siap diklaim.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTrahId(autoJoinedBanner.trahId);
+                setViewMode('excel');
+                setSearchQuery('');
+                setExcelGenFilter('all');
+                setExcelParentFilter('all');
+                setAutoJoinedBanner(null);
+                showNotification('Klik nama Anda di tabel lalu pilih "Klaim Nama Ini Sebagai Saya".');
+              }}
+              className="px-2.5 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-stone-950 font-extrabold text-[11px] flex items-center gap-1 shadow-2xs transition"
+            >
+              <UserCheck className="w-3.5 h-3.5" />
+              <span>Klaim Nama Saya</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setAutoJoinedBanner(null)}
+              className="p-1 rounded-lg bg-white/10 hover:bg-white/20 text-white"
+              title="Tutup"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ========================================================= */}
       {/* 3. KANVAS UTAMA: GRID INTERAKTIF, TABEL EXCEL & MEDSOS    */}
@@ -2878,12 +3483,14 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                     type="text"
                     value={inviteJoinInput}
                     onChange={(e) => setInviteJoinInput(e.target.value)}
-                    placeholder="Tempel link (?trahInvite=...) atau kode LQH1:..."
+                    placeholder="Tempel link (?t=...) atau kode LQH2_ / LQH1:..."
                     className="flex-1 min-w-0 px-3 py-2 text-xs bg-white border border-stone-300 rounded-xl focus:border-emerald-600 outline-hidden"
                   />
                   <button
                     type="button"
-                    onClick={() => handleAcceptTrahInvite(inviteJoinInput)}
+                    onClick={() => {
+                      void handleAcceptTrahInvite(inviteJoinInput);
+                    }}
                     className="px-3.5 py-2 rounded-xl bg-amber-400 hover:bg-amber-500 text-stone-950 font-extrabold text-xs shrink-0 transition"
                   >
                     Gabung
@@ -3142,6 +3749,13 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                                 {m.callName && m.callName !== m.name && (
                                   <div className="text-[10px] text-stone-500 pl-5">
                                     &ldquo;{m.callName}&rdquo;
+                                  </div>
+                                )}
+                                {m.claimedByName && (
+                                  <div className="pl-5 mt-0.5">
+                                    <span className="inline-flex items-center gap-1 px-1.5 py-0.2 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 text-[9px] font-bold">
+                                      ✓ Diklaim: {m.claimedByName}
+                                    </span>
                                   </div>
                                 )}
                               </button>
@@ -3686,6 +4300,13 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
             onResetExampleSanta={handleResetExampleSanta}
             trahPostsCount={trahPosts.length}
             savedDesignsCount={countSavedGridDesigns}
+            activityLogs={activityLogs}
+            onClearActivityLogs={() => {
+              setActivityLogs([]);
+              showNotification('Log aktivitas silsilah telah dibersihkan.');
+            }}
+            initialSectionTab={settingsSectionTrigger.tab}
+            sectionTriggerKey={settingsSectionTrigger.key}
             showNotification={showNotification}
           />
         ) : (
@@ -3967,6 +4588,22 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                       <span>Buat Buku Leluhur (PDF)</span>
                     </span>
                     <span className="text-[9px] bg-emerald-950/60 text-amber-300 px-1.5 py-0.5 rounded font-bold">A4/A5/A6</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setIsSidebarOpen(false);
+                      openSettingsTab('logs');
+                    }}
+                    className="w-full py-2 px-3 rounded-xl bg-stone-800 hover:bg-stone-700 text-stone-200 font-bold text-xs flex items-center justify-between border border-stone-700 shadow-xs active:scale-95 transition"
+                  >
+                    <span className="flex items-center gap-2">
+                      <History className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Log Aktivitas &amp; Klaim</span>
+                    </span>
+                    <span className="text-[9px] bg-emerald-950/70 text-emerald-300 px-1.5 py-0.5 rounded font-bold">
+                      {activityLogs.length}
+                    </span>
                   </button>
 
                   <button
@@ -4857,6 +5494,48 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
               )}
             </div>
 
+            {/* Klaim Identitas Diri di Silsilah */}
+            <div className="p-3 rounded-2xl border border-emerald-200 bg-emerald-50/70 space-y-2">
+              {selectedMember.claimedByName ? (
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-extrabold text-emerald-900 flex items-center gap-1">
+                      <UserCheck className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                      <span className="truncate">Diklaim oleh: {selectedMember.claimedByName}</span>
+                    </p>
+                    <p className="text-[10px] text-emerald-700 truncate">
+                      {selectedMember.claimedByEmail || 'Akun Terverifikasi'}
+                    </p>
+                  </div>
+                  {(selectedMember.claimedByEmail === (accountScope.email || accountProfile.email || `akun-${accountScope.scopeKey}`) ||
+                    accountScope.isOwner) && (
+                    <button
+                      type="button"
+                      onClick={() => handleUnclaimMember(selectedMember)}
+                      className="px-2.5 py-1 rounded-lg bg-white hover:bg-rose-50 text-rose-700 border border-rose-200 text-[10px] font-bold shrink-0 transition"
+                    >
+                      Lepas Klaim
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-bold text-stone-800">Apakah ini profil Anda?</p>
+                    <p className="text-[10px] text-stone-500">Tandai sebagai akun Anda &amp; catat di Log Aktivitas.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleClaimMember(selectedMember)}
+                    className="px-2.5 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-extrabold text-[11px] flex items-center gap-1 shrink-0 shadow-2xs transition active:scale-95"
+                  >
+                    <UserCheck className="w-3.5 h-3.5" />
+                    <span>Klaim Saya</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
             {/* Aksi */}
             <div className="flex gap-2 pt-1">
               <button
@@ -4951,42 +5630,89 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
 
             {(() => {
               const target = inviteTrahTarget || activeTrah;
-              const inviteToken = encodeTrahInviteToken(
+              const fallbackToken = encodeTrahInviteToken(
                 target,
                 accountProfile.displayName || 'Keluarga'
               );
-              const inviteLink = `${window.location.origin}${window.location.pathname}?trahInvite=${encodeURIComponent(inviteToken)}`;
-              const inviteText = `Assalamualaikum Wr. Wb. / Salam Hangat Keluarga Besar,\n\nAnda diundang bergabung ke silsilah keluarga:\n🌳 *${target.name}*\n${target.description}\n\nSaat ini telah tercatat ${target.members.length} saudara/anggota trah.\nKlik link undangan khusus Trah ini (atau tempel kode undangan di LeluhurQu):\n👉 ${inviteLink}\n\nKode Undangan:\n${inviteToken}\n\nSalam hangat silaturahmi keluarga!`;
+              const activeToken = compactInviteToken || fallbackToken;
+              const inviteLink = `${window.location.origin}${window.location.pathname}?t=${encodeURIComponent(activeToken)}`;
+              const inviteText = `Assalamualaikum / Salam Hangat,\n\nAnda diundang masuk ke silsilah keluarga *${target.name}* (${target.members.length} anggota tercatat) di LeluhurQu.\n\nKlik link ini untuk langsung membuka & masuk otomatis ke Trah:\n${inviteLink}`;
+
+              const recordShareLog = (channel: string) => {
+                appendActivityLog({
+                  trahId: target.id,
+                  trahName: target.name,
+                  actionType: 'invite_share',
+                  targetName: channel,
+                  summary: `Membagikan link undangan Trah "${target.name}" via ${channel}`,
+                  details: `${target.members.length} anggota disertakan dalam link ringkas.`,
+                });
+              };
 
               return (
                 <>
-                  {/* Preview Teks Undangan */}
-                  <div className="bg-stone-50 p-3 rounded-2xl border border-stone-200 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">
-                        Link &amp; Kode Undangan Khusus Trah:
+                  {/* Link Singkat Auto-Masuk */}
+                  <div className="bg-emerald-50/70 p-3 rounded-2xl border border-emerald-200 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-extrabold text-emerald-900 uppercase tracking-wider flex items-center gap-1">
+                        <Link2 className="w-3.5 h-3.5 text-emerald-700" />
+                        <span>Link Ringkas Auto-Masuk Trah</span>
                       </span>
                       <button
                         type="button"
                         onClick={() => {
-                          navigator.clipboard.writeText(inviteToken);
-                          showNotification('Kode undangan (LQH1) berhasil disalin! 📋');
+                          navigator.clipboard.writeText(activeToken);
+                          recordShareLog('Salin Kode Manual');
+                          showNotification('Kode manual undangan berhasil disalin! 📋');
                         }}
-                        className="text-[10px] font-extrabold text-emerald-700 hover:text-emerald-900"
+                        className="text-[10px] font-bold text-emerald-800 hover:underline"
                       >
-                        Salin Kode Saja
+                        Salin Kode Manual
                       </button>
                     </div>
-                    <div className="bg-white p-3 rounded-xl border border-stone-200 text-xs text-stone-700 leading-relaxed font-sans shadow-2xs whitespace-pre-wrap select-text max-h-40 overflow-y-auto">
+
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="text"
+                        readOnly
+                        value={inviteLink}
+                        onClick={(e) => (e.target as HTMLInputElement).select()}
+                        className="flex-1 min-w-0 px-2.5 py-1.5 text-[11px] font-mono bg-white border border-emerald-300 rounded-xl text-stone-700 outline-hidden select-all"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(inviteLink);
+                          recordShareLog('Salin Link');
+                          showNotification('Link ringkas undangan Trah disalin! 🔗');
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-extrabold text-[11px] shrink-0 transition"
+                      >
+                        Salin Link
+                      </button>
+                    </div>
+
+                    <p className="text-[10px] text-emerald-800 leading-snug">
+                      ✨ Dikompres otomatis (tanpa foto) agar jauh lebih pendek. Penerima yang klik link langsung otomatis masuk ke Trah <strong>{target.name}</strong>.
+                    </p>
+                  </div>
+
+                  {/* Preview Pesan WhatsApp */}
+                  <div className="bg-stone-50 p-3 rounded-2xl border border-stone-200 space-y-1.5">
+                    <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">
+                      Pratinjau Pesan Siap Kirim:
+                    </span>
+                    <div className="bg-white p-2.5 rounded-xl border border-stone-200 text-xs text-stone-700 leading-relaxed font-sans shadow-2xs whitespace-pre-wrap select-text max-h-28 overflow-y-auto">
                       {inviteText}
                     </div>
                   </div>
 
-                  {/* Tombol Bagikan ke WhatsApp, ChatQu Warga, dan Salin Teks */}
+                  {/* Tombol Bagikan ke WhatsApp, ChatQu Warga, dan Salin Pesan */}
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
                     <button
                       type="button"
                       onClick={() => {
+                        recordShareLog('WhatsApp');
                         window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(inviteText)}`, '_blank');
                         showNotification('Membuka WhatsApp untuk mengirim undangan trah! 💬');
                       }}
@@ -5000,12 +5726,13 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                       type="button"
                       onClick={() => {
                         navigator.clipboard.writeText(inviteText);
+                        recordShareLog('ChatQu Warga');
                         if (onOpenChatQu) {
                           setIsInviteModalOpen(false);
                           onOpenChatQu();
-                          showNotification('Undangan disalin & membuka ChatQu Warga untuk tempel link! 📢');
+                          showNotification('Link undangan disalin & membuka ChatQu Warga! 📢');
                         } else {
-                          showNotification('Undangan disalin. Buka ChatQu melalui menu utama WargaQu');
+                          showNotification('Link undangan disalin. Buka ChatQu melalui menu utama WargaQu');
                         }
                       }}
                       className="py-2.5 px-3 rounded-xl bg-teal-700 hover:bg-teal-800 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm active:scale-95 transition"
@@ -5018,7 +5745,8 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                       type="button"
                       onClick={() => {
                         navigator.clipboard.writeText(inviteText);
-                        showNotification('Link & kode undangan berhasil disalin ke clipboard! 📋');
+                        recordShareLog('Salin Pesan');
+                        showNotification('Pesan & link ringkas berhasil disalin! 📋');
                       }}
                       className="py-2.5 px-3 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-800 font-extrabold text-xs flex items-center justify-center gap-1.5 active:scale-95 transition border border-stone-300"
                     >

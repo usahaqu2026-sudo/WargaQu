@@ -27,12 +27,23 @@ import {
   KeyRound,
   Download,
   MailOpen,
-  Archive
+  Archive,
+  Link2,
+  Copy,
+  Users,
+  LogOut,
+  Sparkles,
+  Trash2,
+  Building2
 } from 'lucide-react';
 import {
   RtSiagaStorage,
   RT_SYNC_EVENT,
+  PENDING_RT_INVITE_KEY,
+  CARRYOVER_RT_INVITE_KEY,
   MONTHS_12,
+  OrgType,
+  RtCommunityWorkspace,
   PaguyubanProfile,
   CoordinatorMember,
   WargaMember,
@@ -47,6 +58,7 @@ import {
   CommunityInvitation,
   InvitationRsvpStatus
 } from '../../services/rtSiagaStorage';
+import { AuthService, AUTH_SYNC_EVENT } from '../../services/authService';
 import { RtExcelService } from '../../services/rtExcelService';
 import { RtExcelAndClaimSheet, ExtraSheetType } from './RtExcelAndClaimSheet';
 import { MonetizationService } from '../../services/monetizationService';
@@ -72,6 +84,8 @@ type SheetModalType =
   | 'buat_post'
   | 'catat_kas'
   | 'pin_pengurus'
+  | 'buat_komunitas'
+  | 'undang_komunitas'
   | ExtraSheetType
   | null;
 
@@ -82,7 +96,14 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
   showNotification,
   initialTab = 'ringkasan',
 }) => {
-  // Shared synced state
+  // Shared synced state (per-account isolated & invite-only)
+  const [communities, setCommunities] = useState<RtCommunityWorkspace[]>(() =>
+    RtSiagaStorage.getCommunities()
+  );
+  const [activeCommunity, setActiveCommunity] = useState<RtCommunityWorkspace | null>(() =>
+    RtSiagaStorage.getActiveCommunity()
+  );
+  const [isOwner, setIsOwner] = useState<boolean>(() => RtSiagaStorage.isOwnerAccount());
   const [profile, setProfile] = useState<PaguyubanProfile>(() => RtSiagaStorage.getProfile());
   const [coordinators, setCoordinators] = useState<CoordinatorMember[]>(() => RtSiagaStorage.getCoordinators());
   const [members, setMembers] = useState<WargaMember[]>(() => RtSiagaStorage.getMembers());
@@ -93,8 +114,47 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
   const [archives, setArchives] = useState<HistoricalArchiveYear[]>(() => RtSiagaStorage.getArchives());
   const [invitations, setInvitations] = useState<CommunityInvitation[]>(() => RtSiagaStorage.getInvitations());
 
+  // Invite link & create community states
+  const [inviteJoinInput, setInviteJoinInput] = useState<string>('');
+  const [isJoiningInvite, setIsJoiningInvite] = useState<boolean>(false);
+  const [autoJoinedBanner, setAutoJoinedBanner] = useState<{
+    communityName: string;
+    inviter: string;
+    orgType: OrgType;
+  } | null>(null);
+  const [compactInviteToken, setCompactInviteToken] = useState<string>('');
+  const [createCommForm, setCreateCommForm] = useState<{
+    orgType: OrgType;
+    customBrandName: string;
+    orgName: string;
+    areaName: string;
+    monthlyDuesAmount: string;
+    creatorName: string;
+    creatorBlock: string;
+    creatorPhone: string;
+    creatorRole: string;
+    pengurusPin: string;
+  }>(() => {
+    const acc = AuthService.getAccount();
+    return {
+      orgType: 'RT',
+      customBrandName: '',
+      orgName: '',
+      areaName: '',
+      monthlyDuesAmount: '50000',
+      creatorName: acc ? AuthService.getDisplayName(acc) : '',
+      creatorBlock: '',
+      creatorPhone: acc?.phone || '',
+      creatorRole: '',
+      pengurusPin: '1234',
+    };
+  });
+
   useEffect(() => {
     const syncAll = () => {
+      setCommunities(RtSiagaStorage.getCommunities());
+      setActiveCommunity(RtSiagaStorage.getActiveCommunity());
+      setIsOwner(RtSiagaStorage.isOwnerAccount());
       setProfile(RtSiagaStorage.getProfile());
       setCoordinators(RtSiagaStorage.getCoordinators());
       setMembers(RtSiagaStorage.getMembers());
@@ -106,15 +166,17 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
       setInvitations(RtSiagaStorage.getInvitations());
     };
     window.addEventListener(RT_SYNC_EVENT, syncAll);
+    window.addEventListener(AUTH_SYNC_EVENT, syncAll);
     window.addEventListener('focus', syncAll);
     return () => {
       window.removeEventListener(RT_SYNC_EVENT, syncAll);
+      window.removeEventListener(AUTH_SYNC_EVENT, syncAll);
       window.removeEventListener('focus', syncAll);
     };
   }, []);
 
   const currentUser = useMemo(
-    () => members.find(m => m.isCurrentUser) || members[0],
+    () => members.find(m => m.isCurrentUser) || members[0] || RtSiagaStorage.getCurrentMember(),
     [members]
   );
 
@@ -273,9 +335,92 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
   const brandTitle =
     profile.orgType === 'Organisasi'
       ? profile.customBrandName?.trim() || 'OrganisasiQu'
+      : profile.orgType === 'Sosial'
+      ? profile.customBrandName?.trim() || 'SosialQu'
       : profile.orgType === 'Paguyuban'
       ? 'PaguyubanQu'
       : 'RTQu';
+
+  // Auto-process incoming invite (?rt=WQR2_...) & carryover on auth login
+  useEffect(() => {
+    let cancelled = false;
+    const processPendingInvite = async () => {
+      let token = '';
+      let fromCarryover = false;
+      try {
+        const pending = localStorage.getItem(PENDING_RT_INVITE_KEY);
+        if (pending) {
+          token = pending;
+          localStorage.removeItem(PENDING_RT_INVITE_KEY);
+          if (!AuthService.getAccount()) {
+            sessionStorage.setItem(CARRYOVER_RT_INVITE_KEY, pending);
+          }
+        } else if (AuthService.getAccount()) {
+          const carry = sessionStorage.getItem(CARRYOVER_RT_INVITE_KEY);
+          if (carry) {
+            token = carry;
+            fromCarryover = true;
+            sessionStorage.removeItem(CARRYOVER_RT_INVITE_KEY);
+          }
+        }
+      } catch {
+        // ignore
+      }
+      if (!token) return;
+
+      const res = await RtSiagaStorage.acceptCommunityInvite(token);
+      if (cancelled) return;
+      if (res.ok && res.community) {
+        setAutoJoinedBanner({
+          communityName: res.community.profile.orgName,
+          inviter: res.inviter || 'Pengurus',
+          orgType: res.community.profile.orgType,
+        });
+        setActiveTab('ringkasan');
+        setIsPengurusMode(false);
+        if (!fromCarryover) {
+          showNotification(res.message);
+        }
+      } else if (!fromCarryover) {
+        showNotification(res.message);
+      }
+    };
+
+    void processPendingInvite();
+    const onInviteArrived = () => {
+      void processPendingInvite();
+    };
+    window.addEventListener('wargaqu-rt-invite-arrived', onInviteArrived);
+    window.addEventListener(AUTH_SYNC_EVENT, onInviteArrived);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('wargaqu-rt-invite-arrived', onInviteArrived);
+      window.removeEventListener(AUTH_SYNC_EVENT, onInviteArrived);
+    };
+  }, [showNotification]);
+
+  // Generate compact invite token when invite modal opens
+  useEffect(() => {
+    let cancelled = false;
+    if (activeSheet === 'undang_komunitas' && activeCommunity) {
+      RtSiagaStorage.encodeCommunityInviteCompact(activeCommunity, currentUser.name)
+        .then(tok => {
+          if (!cancelled) setCompactInviteToken(tok);
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setCompactInviteToken(
+              RtSiagaStorage.encodeCommunityInvite(activeCommunity, currentUser.name)
+            );
+          }
+        });
+    } else {
+      setCompactInviteToken('');
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSheet, activeCommunity, currentUser.name]);
 
   // Handlers
   const handleConfirmPaySelectedMonths = (method: string) => {
@@ -478,18 +623,104 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     const updatedMember = RtSiagaStorage.getMembers().find(m => m.id === member.id) || member;
     const code = updatedMember.claimCode || '-';
     const last4 = updatedMember.phone.replace(/\D/g, '').slice(-4) || '0000';
-    const inviteText = `Halo Bpk/Ibu ${updatedMember.name} (${updatedMember.block}),\nData warga & kartu iuran ${brandTitle} (${profile.orgName}) tahun ${profile.year} sudah disiapkan.\n\nSilakan unduh/buka aplikasi WargaQu → masuk menu ${brandTitle} → pilih "Klaim Profil Warga":\n• Kode Klaim: ${code}\n• Verifikasi 4 digit terakhir No HP: ${last4}\n\nTerima kasih,\nPengurus ${profile.orgName}`;
+    let shareUrlLine = '';
+    if (activeCommunity) {
+      try {
+        const token = await RtSiagaStorage.encodeCommunityInviteCompact(
+          activeCommunity,
+          currentUser.name,
+          updatedMember
+        );
+        const url = `${window.location.origin}${window.location.pathname}?rt=${token}`;
+        shareUrlLine = `\n👉 Klik Link Auto-Gabung (Otomatis masuk & klaim data Anda):\n${url}\n`;
+      } catch {
+        // ignore compact url error
+      }
+    }
+    const inviteText = `Halo Bpk/Ibu ${updatedMember.name} (${updatedMember.block}),\nAnda diundang bergabung di ${brandTitle} (${profile.orgName}) tahun ${profile.year}.\n${shareUrlLine}\nJika masuk manual lewat menu ${brandTitle}:\n• Kode Klaim: ${code}\n• Verifikasi 4 digit terakhir No HP: ${last4}\n\nTerima kasih,\n${profile.orgName}`;
 
     if (navigator.clipboard) {
       try {
         await navigator.clipboard.writeText(inviteText);
-        showNotification(`Pesan undangan & Kode Klaim (${code}) disalin! Siap kirim ke WA ${updatedMember.name}.`);
+        showNotification(`Link auto-gabung & undangan WA untuk ${updatedMember.name} disalin!`);
         return;
       } catch {
         // fallback notification
       }
     }
     showNotification(`Status ${updatedMember.name} ditandai Terundang (Kode: ${code}).`);
+  };
+
+  const handleJoinByInviteInput = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!inviteJoinInput.trim()) {
+      showNotification('Tempel link undangan (?rt=...) atau token WQR2_ dari pengurus.');
+      return;
+    }
+    setIsJoiningInvite(true);
+    try {
+      const res = await RtSiagaStorage.acceptCommunityInvite(inviteJoinInput);
+      if (res.ok && res.community) {
+        setInviteJoinInput('');
+        setAutoJoinedBanner({
+          communityName: res.community.profile.orgName,
+          inviter: res.inviter || 'Pengurus',
+          orgType: res.community.profile.orgType,
+        });
+        setActiveTab('ringkasan');
+        setIsPengurusMode(false);
+        showNotification(res.message);
+      } else {
+        showNotification(res.message);
+      }
+    } finally {
+      setIsJoiningInvite(false);
+    }
+  };
+
+  const handleCreateCommunitySubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!createCommForm.orgName.trim()) {
+      showNotification('Masukkan nama RT / Paguyuban / Organisasi / Sosial.');
+      return;
+    }
+    const dues = Math.max(0, parseInt(createCommForm.monthlyDuesAmount.replace(/\D/g, ''), 10) || 0);
+    const created = RtSiagaStorage.createCommunity({
+      orgType: createCommForm.orgType,
+      customBrandName: createCommForm.customBrandName,
+      orgName: createCommForm.orgName,
+      areaName: createCommForm.areaName,
+      monthlyDuesAmount: dues,
+      pengurusPin: createCommForm.pengurusPin,
+      creatorName: createCommForm.creatorName,
+      creatorBlock: createCommForm.creatorBlock,
+      creatorPhone: createCommForm.creatorPhone,
+      creatorRole: createCommForm.creatorRole,
+    });
+    setActiveSheet(null);
+    setActiveTab('ringkasan');
+    setIsPengurusMode(true);
+    setAutoJoinedBanner(null);
+    setCreateCommForm(prev => ({
+      ...prev,
+      customBrandName: '',
+      orgName: '',
+      areaName: '',
+      creatorRole: '',
+    }));
+    showNotification(
+      `Komunitas "${created.profile.orgName}" berhasil dibuat! Bagikan link undangan ke warga/anggota.`
+    );
+  };
+
+  const handleLeaveActiveCommunity = () => {
+    if (!activeCommunity) return;
+    const removedName = activeCommunity.profile.orgName;
+    RtSiagaStorage.leaveOrDeleteCommunity(activeCommunity.id);
+    setIsPengurusMode(false);
+    setActiveTab('ringkasan');
+    setAutoJoinedBanner(null);
+    showNotification(`Keluar dari komunitas "${removedName}".`);
   };
 
   const handleShareEventInvitation = async (inv: CommunityInvitation) => {
@@ -505,6 +736,10 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     }
     showNotification('Undangan acara siap dibagikan.');
   };
+
+  const communityInviteUrl = compactInviteToken
+    ? `${window.location.origin}${window.location.pathname}?rt=${compactInviteToken}`
+    : '';
 
   return (
     <div className="w-full h-full bg-white overflow-hidden flex flex-col relative select-none text-slate-800">
@@ -522,53 +757,241 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
               <ArrowLeft className="w-5 h-5" />
             </button>
             <div className="min-w-0">
-              <div className="flex items-center gap-1.5">
-                <h1 className="text-base font-extrabold tracking-tight text-slate-900 truncate">
-                  {brandTitle}
-                </h1>
-                <span className="text-xs text-slate-400">·</span>
-                <span className="text-xs font-semibold text-emerald-700 truncate">
-                  {profile.orgName}
-                </span>
-              </div>
-              <button
-                onClick={() => setActiveSheet('klaim_profil')}
-                className="text-[11px] text-slate-500 hover:text-emerald-700 truncate flex items-center gap-1 text-left"
-                title="Klaim Profil Warga atau Ganti Akun"
-              >
-                <span className="truncate">
-                  {currentUser.name} · {currentUser.block} · {currentUser.wargaId}
-                </span>
-                <span className="text-emerald-700 font-bold shrink-0">· Klaim/Ganti</span>
-              </button>
+              {activeCommunity ? (
+                <>
+                  <div className="flex items-center gap-1.5">
+                    <h1 className="text-base font-extrabold tracking-tight text-slate-900 truncate">
+                      {brandTitle}
+                    </h1>
+                    <span className="text-xs text-slate-400">·</span>
+                    <span className="text-xs font-semibold text-emerald-700 truncate">
+                      {profile.orgName}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setActiveSheet('klaim_profil')}
+                    className="text-[11px] text-slate-500 hover:text-emerald-700 truncate flex items-center gap-1 text-left"
+                    title="Klaim Profil Warga atau Ganti Akun"
+                  >
+                    <span className="truncate">
+                      {currentUser.name} · {currentUser.block} · {currentUser.wargaId}
+                    </span>
+                    <span className="text-emerald-700 font-bold shrink-0">· Klaim/Ganti</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center gap-1.5">
+                    <h1 className="text-base font-extrabold tracking-tight text-slate-900 truncate">
+                      RTQu & Komunitas
+                    </h1>
+                  </div>
+                  <p className="text-[11px] text-slate-500 truncate">
+                    Khusus Undangan Warga atau Buat Komunitas Baru
+                  </p>
+                </>
+              )}
             </div>
           </div>
 
-          <button
-            onClick={() => {
-              if (isPengurusMode) {
-                setIsPengurusMode(false);
-                showNotification('Keluar dari Mode Pengurus');
-              } else {
-                setActiveSheet('pin_pengurus');
-              }
-            }}
-            className={`min-h-[38px] px-2.5 py-1.5 rounded-lg border text-[11px] font-bold flex items-center gap-1.5 transition shrink-0 ${
-              isPengurusMode
-                ? 'bg-emerald-700 text-white border-emerald-700'
-                : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-            }`}
-          >
-            {isPengurusMode ? <Unlock className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
-            <span>{isPengurusMode ? 'Pengurus' : 'Mode Pengurus'}</span>
-          </button>
+          {activeCommunity ? (
+            <button
+              onClick={() => {
+                if (isPengurusMode) {
+                  setIsPengurusMode(false);
+                  showNotification('Keluar dari Mode Pengurus');
+                } else {
+                  setActiveSheet('pin_pengurus');
+                }
+              }}
+              className={`min-h-[38px] px-2.5 py-1.5 rounded-lg border text-[11px] font-bold flex items-center gap-1.5 transition shrink-0 ${
+                isPengurusMode
+                  ? 'bg-emerald-700 text-white border-emerald-700'
+                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+              }`}
+            >
+              {isPengurusMode ? <Unlock className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
+              <span>{isPengurusMode ? 'Pengurus' : 'Mode Pengurus'}</span>
+            </button>
+          ) : (
+            <button
+              onClick={() => setActiveSheet('buat_komunitas')}
+              className="min-h-[38px] px-3 py-1.5 rounded-lg bg-emerald-700 text-white text-[11px] font-bold flex items-center gap-1 transition shrink-0"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Buat Baru</span>
+            </button>
+          )}
         </div>
+
+        {/* Multi-Komunitas Paralel Bar (RTQu / PaguyubanQu / Organisasi / Sosial) */}
+        {communities.length > 0 && (
+          <div className="mt-2.5 flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+            {communities.map(comm => {
+              const isActive = activeCommunity?.id === comm.id;
+              const typeBadge =
+                comm.profile.orgType === 'Paguyuban'
+                  ? 'Paguyuban'
+                  : comm.profile.orgType === 'Organisasi'
+                  ? comm.profile.customBrandName?.trim() || 'Org'
+                  : comm.profile.orgType === 'Sosial'
+                  ? comm.profile.customBrandName?.trim() || 'Sosial'
+                  : 'RT';
+              return (
+                <button
+                  key={comm.id}
+                  onClick={() => {
+                    RtSiagaStorage.setActiveCommunityId(comm.id);
+                    setIsPengurusMode(false);
+                    setAutoJoinedBanner(null);
+                  }}
+                  className={`min-h-[32px] px-2.5 py-1 rounded-lg border text-[11px] font-bold whitespace-nowrap flex items-center gap-1.5 shrink-0 transition ${
+                    isActive
+                      ? 'bg-emerald-700 text-white border-emerald-700'
+                      : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                  }`}
+                >
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded font-extrabold ${
+                      isActive ? 'bg-white/20 text-white' : 'bg-white text-slate-600 border border-slate-200'
+                    }`}
+                  >
+                    {typeBadge}
+                  </span>
+                  <span className="max-w-[140px] truncate">{comm.profile.orgName}</span>
+                </button>
+              );
+            })}
+            <button
+              onClick={() => setActiveSheet('undang_komunitas')}
+              className="min-h-[32px] px-2.5 py-1 rounded-lg border border-emerald-600 text-emerald-700 bg-emerald-50 text-[11px] font-bold whitespace-nowrap flex items-center gap-1 shrink-0"
+              title="Bagikan Link Undangan Warga"
+            >
+              <Link2 className="w-3 h-3" />
+              <span>Undang</span>
+            </button>
+            <button
+              onClick={() => setActiveSheet('buat_komunitas')}
+              className="min-h-[32px] px-2.5 py-1 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-[11px] font-bold whitespace-nowrap flex items-center gap-1 shrink-0"
+              title="Buat Komunitas RT / Paguyuban / Organisasi / Sosial Baru"
+            >
+              <Plus className="w-3 h-3" />
+              <span>Baru</span>
+            </button>
+          </div>
+        )}
       </header>
 
       {/* ===================================================================== */}
       {/* 2. MAIN CONTENT BY TAB (MINIMALIST LIST VIEW + HAIRLINE DIVIDERS)     */}
       {/* ===================================================================== */}
       <main className="flex-1 overflow-y-auto no-scrollbar bg-white">
+        {autoJoinedBanner && (
+          <div className="mx-4 mt-3 px-3.5 py-2.5 rounded-xl border border-emerald-300 bg-emerald-50 flex items-start justify-between gap-2">
+            <div className="text-xs text-emerald-950 space-y-0.5">
+              <div className="font-bold flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                <span>Otomatis Masuk {autoJoinedBanner.communityName}</span>
+              </div>
+              <p className="text-[11px] text-emerald-800">
+                Diundang oleh <strong>{autoJoinedBanner.inviter}</strong> ({autoJoinedBanner.orgType}). Data komunitas ini tersimpan aman di HP Anda.
+              </p>
+            </div>
+            <button
+              onClick={() => setAutoJoinedBanner(null)}
+              className="p-1 text-emerald-700 hover:text-emerald-900"
+              title="Tutup"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* EMPTY / INVITE-ONLY ONBOARDING STATE (0 COMMUNITIES) */}
+        {communities.length === 0 ? (
+          <div className="p-4 space-y-4">
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-2.5">
+              <div className="flex items-center gap-2 text-emerald-800">
+                <ShieldCheck className="w-5 h-5 shrink-0" />
+                <h2 className="text-sm font-extrabold tracking-tight text-slate-900">
+                  Komunitas Warga Khusus Undangan
+                </h2>
+              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Akun Anda belum terhubung ke RT, Paguyuban, Organisasi, atau Sosial manapun. Demi privasi & data tersimpan penuh di HP masing-masing (tanpa server pusat), data warga hanya tampil jika Anda <strong>menerima undangan resmi</strong> atau <strong>membuat komunitas baru</strong>.
+              </p>
+            </div>
+
+            {/* Option 1: Join via Invite Link / Token */}
+            <form
+              onSubmit={handleJoinByInviteInput}
+              className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs font-extrabold text-slate-900 flex items-center gap-1.5">
+                    <Link2 className="w-4 h-4 text-emerald-700" />
+                    <span>Punya Undangan dari Pengurus?</span>
+                  </h3>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Tempel link undangan (?rt=...) atau kode token (WQR2_...) untuk langsung bergabung.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={inviteJoinInput}
+                  onChange={e => setInviteJoinInput(e.target.value)}
+                  placeholder="Tempel link ?rt=WQR2_... atau kode token"
+                  className="flex-1 min-h-[42px] border border-slate-300 rounded-xl px-3 text-xs focus:outline-none focus:border-emerald-700"
+                />
+                <button
+                  type="submit"
+                  disabled={isJoiningInvite}
+                  className="min-h-[42px] px-4 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 text-white rounded-xl text-xs font-bold shrink-0"
+                >
+                  {isJoiningInvite ? 'Memproses...' : 'Gabung'}
+                </button>
+              </div>
+            </form>
+
+            {/* Option 2: Create New Community */}
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-4 space-y-3">
+              <div>
+                <h3 className="text-xs font-extrabold text-slate-900 flex items-center gap-1.5">
+                  <Building2 className="w-4 h-4 text-emerald-700" />
+                  <span>Belum Ada yang Mengurus di Lingkungan Anda?</span>
+                </h3>
+                <p className="text-[11px] text-slate-600 mt-1 leading-relaxed">
+                  Buat ruang digital sendiri untuk <strong>RTQu</strong>, <strong>PaguyubanQu</strong> (cluster/perumahan yang RT-nya belum aktif), <strong>Organisasi</strong> (partai/ormas/komunitas), atau <strong>Sosial</strong> (DKM/panti/yayasan) — gratis & langsung bisa undang warga via WA.
+                </p>
+              </div>
+              <button
+                onClick={() => setActiveSheet('buat_komunitas')}
+                className="w-full min-h-[44px] bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Buat RT / Paguyuban / Organisasi Baru</span>
+              </button>
+            </div>
+
+            {isOwner && (
+              <div className="pt-2 border-t border-slate-200 text-center">
+                <button
+                  onClick={() => {
+                    RtSiagaStorage.reloadOwnerDefaultCommunity();
+                    showNotification('Workspace contoh RT 03 / RW 05 dimuat kembali.');
+                  }}
+                  className="text-[11px] font-bold text-slate-500 hover:text-emerald-700 underline"
+                >
+                  Muat Ulang Data Contoh Owner (RT 03 / RW 05)
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <>
         {/* TAB 1: RINGKASAN */}
         {activeTab === 'ringkasan' && (
           <div className="divide-y divide-slate-200">
@@ -1735,14 +2158,14 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
               </div>
             )}
 
-            {/* Sub-Tab 4: Pengaturan RTQu / PaguyubanQu / Organisasi Lain */}
+            {/* Sub-Tab 4: Pengaturan RTQu / PaguyubanQu / Organisasi / Sosial */}
             {pengurusSubTab === 'pengaturan' && (
               <form onSubmit={handleSaveOrgSettings} className="p-4 space-y-3">
                 <div>
                   <label className="text-xs font-bold text-slate-700 block mb-1.5">
                     Jenis Komunitas / Organisasi
                   </label>
-                  <div className="grid grid-cols-3 gap-1.5">
+                  <div className="grid grid-cols-2 gap-1.5">
                     <button
                       type="button"
                       onClick={() => setOrgDraft(prev => ({ ...prev, orgType: 'RT' }))}
@@ -1774,15 +2197,26 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                           : 'bg-white text-slate-700 border-slate-300'
                       }`}
                     >
-                      Organisasi Lain
+                      Organisasi / Ormas
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setOrgDraft(prev => ({ ...prev, orgType: 'Sosial' }))}
+                      className={`min-h-[40px] rounded-lg border text-xs font-bold ${
+                        orgDraft.orgType === 'Sosial'
+                          ? 'bg-emerald-700 text-white border-emerald-700'
+                          : 'bg-white text-slate-700 border-slate-300'
+                      }`}
+                    >
+                      Sosial (DKM / Panti)
                     </button>
                   </div>
                 </div>
 
-                {orgDraft.orgType === 'Organisasi' && (
+                {(orgDraft.orgType === 'Organisasi' || orgDraft.orgType === 'Sosial') && (
                   <div>
                     <label className="text-xs font-bold text-slate-700 block mb-1">
-                      Nama Modul / Organisasi Kustom
+                      Nama Modul / Lembaga Kustom
                     </label>
                     <input
                       type="text"
@@ -1790,7 +2224,11 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                       onChange={e =>
                         setOrgDraft(prev => ({ ...prev, customBrandName: e.target.value }))
                       }
-                      placeholder="Contoh: DKM Al-Ikhlas / Karang Taruna / KomunitasQu"
+                      placeholder={
+                        orgDraft.orgType === 'Sosial'
+                          ? 'Contoh: DKM Al-Ikhlas / Panti Asuhan Harapan'
+                          : 'Contoh: Karang Taruna / Ikatan Alumni / Ormas'
+                      }
                       className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3 text-xs"
                     />
                   </div>
@@ -1811,7 +2249,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
 
                 <div>
                   <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Iuran Bulanan (Rp)
+                    Iuran Rutin per Bulan (Rp, isi 0 jika donasi sukarela)
                   </label>
                   <input
                     type="number"
@@ -1819,7 +2257,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                     onChange={e =>
                       setOrgDraft(prev => ({
                         ...prev,
-                        monthlyDuesAmount: parseInt(e.target.value, 10) || 50000,
+                        monthlyDuesAmount: Math.max(0, parseInt(e.target.value, 10) || 0),
                       }))
                     }
                     className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3 text-xs font-mono"
@@ -1833,6 +2271,25 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                   Simpan Pengaturan
                 </button>
 
+                <div className="grid grid-cols-2 gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setActiveSheet('undang_komunitas')}
+                    className="min-h-[40px] border border-emerald-700 text-emerald-700 hover:bg-emerald-50 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5"
+                  >
+                    <Link2 className="w-3.5 h-3.5" />
+                    <span>Bagikan Undangan</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleLeaveActiveCommunity}
+                    className="min-h-[40px] border border-rose-300 text-rose-700 hover:bg-rose-50 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Keluar / Hapus</span>
+                  </button>
+                </div>
+
                 <div className="pt-2 border-t border-slate-200">
                   <EncryptedBackupPanel
                     scope="rtqu"
@@ -1845,32 +2302,36 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
             )}
           </div>
         )}
+          </>
+        )}
       </main>
 
       {/* ===================================================================== */}
       {/* 3. MINIMALIST BOTTOM TAB BAR (5 TABS)                                 */}
       {/* ===================================================================== */}
-      <nav className="bg-white border-t border-slate-200 grid grid-cols-5 h-14 shrink-0 z-20">
-        {[
-          { id: 'ringkasan', label: 'Ringkasan' },
-          { id: 'forum', label: 'Forum' },
-          { id: 'keuangan', label: 'Keuangan' },
-          { id: 'iuran', label: 'Kartu' },
-          { id: 'pengurus', label: 'Pengurus' },
-        ].map(tab => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id as MainTab)}
-            className={`text-[11px] font-bold border-t-2 transition-colors whitespace-nowrap ${
-              activeTab === tab.id
-                ? 'border-emerald-700 text-emerald-700'
-                : 'border-transparent text-slate-500 hover:text-slate-800'
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </nav>
+      {communities.length > 0 && (
+        <nav className="bg-white border-t border-slate-200 grid grid-cols-5 h-14 shrink-0 z-20">
+          {[
+            { id: 'ringkasan', label: 'Ringkasan' },
+            { id: 'forum', label: 'Forum' },
+            { id: 'keuangan', label: 'Keuangan' },
+            { id: 'iuran', label: 'Kartu' },
+            { id: 'pengurus', label: 'Pengurus' },
+          ].map(tab => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as MainTab)}
+              className={`text-[11px] font-bold border-t-2 transition-colors whitespace-nowrap ${
+                activeTab === tab.id
+                  ? 'border-emerald-700 text-emerald-700'
+                  : 'border-transparent text-slate-500 hover:text-slate-800'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+      )}
 
       {/* ===================================================================== */}
       {/* 4. MINIMALIST SHEETS / MODALS                                         */}
@@ -1888,6 +2349,8 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                 {activeSheet === 'ronda' && 'Jadwal Ronda & Kerja Bakti'}
                 {activeSheet === 'catat_kas' && 'Catat Pemasukan / Pengeluaran Kas'}
                 {activeSheet === 'pin_pengurus' && 'Verifikasi PIN Pengurus'}
+                {activeSheet === 'buat_komunitas' && 'Buat Komunitas Baru (RT / Paguyuban / Org / Sosial)'}
+                {activeSheet === 'undang_komunitas' && `Undang Warga ke ${profile.orgName}`}
                 {activeSheet === 'import_excel' && 'Smart Impor Excel (Poin Penting)'}
                 {activeSheet === 'klaim_profil' && 'Klaim Profil Warga (Kode Undangan)'}
                 {activeSheet === 'buat_undangan' && 'Buat Undangan Acara & RSVP'}
@@ -2328,6 +2791,255 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                   >
                     Bagikan & Konfirmasi Kehadiran di Forum
                   </button>
+                </div>
+              )}
+
+              {/* SHEET: BUAT KOMUNITAS BARU */}
+              {activeSheet === 'buat_komunitas' && (
+                <form onSubmit={handleCreateCommunitySubmit} className="space-y-3">
+                  <div>
+                    <label className="font-bold text-slate-700 block mb-1.5">
+                      Pilih Kategori Komunitas
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {[
+                        { id: 'RT' as OrgType, label: 'RTQu (Rukun Tetangga)', desc: 'RT resmi / wilayah' },
+                        { id: 'Paguyuban' as OrgType, label: 'PaguyubanQu', desc: 'Cluster / perumahan / warga' },
+                        { id: 'Organisasi' as OrgType, label: 'Organisasi', desc: 'Ormas / partai / alumni' },
+                        { id: 'Sosial' as OrgType, label: 'Sosial / DKM', desc: 'Masjid / panti / yayasan' },
+                      ].map(opt => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setCreateCommForm(prev => ({ ...prev, orgType: opt.id }))}
+                          className={`p-2 rounded-xl border text-left transition ${
+                            createCommForm.orgType === opt.id
+                              ? 'bg-emerald-700 text-white border-emerald-700'
+                              : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                          }`}
+                        >
+                          <div className="text-[11px] font-extrabold">{opt.label}</div>
+                          <div
+                            className={`text-[10px] ${
+                              createCommForm.orgType === opt.id ? 'text-emerald-100' : 'text-slate-500'
+                            }`}
+                          >
+                            {opt.desc}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {(createCommForm.orgType === 'Organisasi' || createCommForm.orgType === 'Sosial') && (
+                    <div>
+                      <label className="font-bold text-slate-700 block mb-1">
+                        Nama Singkat Modul
+                      </label>
+                      <input
+                        type="text"
+                        value={createCommForm.customBrandName}
+                        onChange={e =>
+                          setCreateCommForm(prev => ({ ...prev, customBrandName: e.target.value }))
+                        }
+                        placeholder={
+                          createCommForm.orgType === 'Sosial'
+                            ? 'Misal: DKM Al-Ikhlas / Panti Harapan'
+                            : 'Misal: Karang Taruna / Komunitas Maju'
+                        }
+                        className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3"
+                      />
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="font-bold text-slate-700 block mb-1">
+                      Nama Komunitas / Wilayah *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={createCommForm.orgName}
+                      onChange={e =>
+                        setCreateCommForm(prev => ({ ...prev, orgName: e.target.value }))
+                      }
+                      placeholder={
+                        createCommForm.orgType === 'RT'
+                          ? 'Contoh: RT 04 / RW 08'
+                          : createCommForm.orgType === 'Paguyuban'
+                          ? 'Contoh: Paguyuban Cluster Harmoni'
+                          : 'Contoh: DKM Masjid Al-Barokah'
+                      }
+                      className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="font-bold text-slate-700 block mb-1">
+                        Area / Kelurahan
+                      </label>
+                      <input
+                        type="text"
+                        value={createCommForm.areaName}
+                        onChange={e =>
+                          setCreateCommForm(prev => ({ ...prev, areaName: e.target.value }))
+                        }
+                        placeholder="Kel. Sukamaju"
+                        className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3"
+                      />
+                    </div>
+                    <div>
+                      <label className="font-bold text-slate-700 block mb-1">
+                        Iuran/Bln (Rp, 0=Sukarela)
+                      </label>
+                      <input
+                        type="number"
+                        value={createCommForm.monthlyDuesAmount}
+                        onChange={e =>
+                          setCreateCommForm(prev => ({
+                            ...prev,
+                            monthlyDuesAmount: e.target.value,
+                          }))
+                        }
+                        className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3 font-mono"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="pt-2 border-t border-slate-200 space-y-2">
+                    <div className="text-[11px] font-extrabold text-slate-700">
+                      Profil Pendiri / Pengurus Utama
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="text"
+                        required
+                        value={createCommForm.creatorName}
+                        onChange={e =>
+                          setCreateCommForm(prev => ({ ...prev, creatorName: e.target.value }))
+                        }
+                        placeholder="Nama Lengkap Anda *"
+                        className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3"
+                      />
+                      <input
+                        type="text"
+                        value={createCommForm.creatorBlock}
+                        onChange={e =>
+                          setCreateCommForm(prev => ({ ...prev, creatorBlock: e.target.value }))
+                        }
+                        placeholder="Blok / Jabatan (Misal: Blok A1)"
+                        className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="text"
+                        value={createCommForm.creatorPhone}
+                        onChange={e =>
+                          setCreateCommForm(prev => ({ ...prev, creatorPhone: e.target.value }))
+                        }
+                        placeholder="No HP / WA"
+                        className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3"
+                      />
+                      <input
+                        type="text"
+                        maxLength={8}
+                        value={createCommForm.pengurusPin}
+                        onChange={e =>
+                          setCreateCommForm(prev => ({ ...prev, pengurusPin: e.target.value }))
+                        }
+                        placeholder="PIN Pengurus (1234)"
+                        className="w-full min-h-[40px] border border-slate-300 rounded-lg px-3 font-mono"
+                      />
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="w-full min-h-[44px] bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl font-bold"
+                  >
+                    Simpan & Aktifkan Komunitas Baru
+                  </button>
+                </form>
+              )}
+
+              {/* SHEET: BAGIKAN LINK UNDANGAN KOMUNITAS (?rt=WQR2_...) */}
+              {activeSheet === 'undang_komunitas' && activeCommunity && (
+                <div className="space-y-3">
+                  <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-1">
+                    <div className="font-extrabold text-emerald-900 text-xs">
+                      Undangan Otomatis (Zero Server DB)
+                    </div>
+                    <p className="text-[11px] text-emerald-800 leading-relaxed">
+                      Warga yang mengklik link ini akan <strong>otomatis membuka {profile.orgName}</strong> di HP masing-masing tanpa melihat data RT/komunitas lain. Untuk warga yang sudah Anda daftarkan di tab Pengurus → Warga, gunakan tombol <strong>Undang WA</strong> agar data blok & iurannya ikut terbawa.
+                    </p>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="font-bold text-slate-700 block">
+                      Link Undangan Praktis (?rt=...)
+                    </label>
+                    <div className="p-2.5 rounded-xl border border-slate-200 bg-slate-50 font-mono text-[10px] text-slate-700 break-all max-h-24 overflow-y-auto">
+                      {communityInviteUrl || 'Menyiapkan link terkompresi...'}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2">
+                    <button
+                      type="button"
+                      disabled={!communityInviteUrl}
+                      onClick={async () => {
+                        if (!communityInviteUrl) return;
+                        try {
+                          await navigator.clipboard.writeText(communityInviteUrl);
+                          showNotification('Link undangan (?rt=...) disalin!');
+                        } catch {
+                          showNotification('Gagal menyalin link.');
+                        }
+                      }}
+                      className="w-full min-h-[42px] bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-xl font-bold flex items-center justify-center gap-1.5"
+                    >
+                      <Copy className="w-4 h-4" />
+                      <span>Salin Link Undangan (?rt=...)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={!communityInviteUrl}
+                      onClick={async () => {
+                        if (!communityInviteUrl) return;
+                        const waText = `Halo Bpk/Ibu/Rekan,\nMari bergabung ke grup digital *${profile.orgName}* (${brandTitle}) di aplikasi WargaQu untuk info warga, forum, iuran transparan & keamanan SiagaQu.\n\n👉 Klik link undangan ini (otomatis masuk):\n${communityInviteUrl}\n\nSalam,\n${currentUser.name}`;
+                        try {
+                          await navigator.clipboard.writeText(waText);
+                          showNotification('Pesan undangan WhatsApp disalin!');
+                        } catch {
+                          showNotification('Gagal menyalin pesan WA.');
+                        }
+                      }}
+                      className="w-full min-h-[42px] border border-emerald-700 text-emerald-700 hover:bg-emerald-50 rounded-xl font-bold flex items-center justify-center gap-1.5"
+                    >
+                      <Share2 className="w-4 h-4" />
+                      <span>Salin Pesan Undangan Grup WA</span>
+                    </button>
+
+                    {compactInviteToken && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(compactInviteToken);
+                            showNotification('Token undangan (WQR2_...) disalin!');
+                          } catch {
+                            showNotification('Gagal menyalin token.');
+                          }
+                        }}
+                        className="w-full min-h-[38px] border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-xl font-bold text-[11px]"
+                      >
+                        Salin Kode Token Saja (Untuk Tempel Manual)
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
