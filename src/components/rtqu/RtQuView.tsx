@@ -35,7 +35,8 @@ import {
   Sparkles,
   Trash2,
   Building2,
-  HelpCircle
+  HelpCircle,
+  RefreshCw
 } from 'lucide-react';
 import { ModuleOnboardingService } from '../../services/moduleOnboardingService';
 import {
@@ -66,7 +67,13 @@ import { RtExcelAndClaimSheet, ExtraSheetType } from './RtExcelAndClaimSheet';
 import { MonetizationService } from '../../services/monetizationService';
 import { EncryptedBackupPanel } from '../common/EncryptedBackupPanel';
 import { RealtimeRelayService } from '../../services/realtimeRelayService';
-import { InviteRelayService } from '../../services/inviteRelayService';
+import {
+  getSyncChannelName,
+  InviteRelayService,
+  parseInviteInput,
+  REALTIME_RELAY_EVENT_NAME,
+  RELAY_REGISTER_CHANNELS_EVENT,
+} from '../../services/inviteRelayService';
 
 interface RtQuViewProps {
   onBackToMain: () => void;
@@ -124,6 +131,12 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     communityName: string;
     inviter: string;
     orgType: OrgType;
+  } | null>(null);
+  const [pendingRtSync, setPendingRtSync] = useState<{
+    title: string;
+    canonicalSlug: string;
+    rawInput: string;
+    isSyncing: boolean;
   } | null>(null);
   const [compactInviteToken, setCompactInviteToken] = useState<string>('');
   const [shortInviteUrl, setShortInviteUrl] = useState<string>('');
@@ -345,7 +358,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
       ? 'PaguyubanQu'
       : 'RTQu';
 
-  // Auto-process incoming invite (?rt=WQR2_...) & carryover on auth login
+  // Auto-process incoming invite (?rt=RT-03-... / ?paguyuban=... / ?grup=...) & carryover on auth login
   useEffect(() => {
     let cancelled = false;
     const processPendingInvite = async () => {
@@ -372,9 +385,20 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
       }
       if (!token) return;
 
+      const parsedHint = parseInviteInput(token, 'rt');
+      if (parsedHint?.mode === 'room_slug') {
+        setPendingRtSync({
+          title: parsedHint.titleGuess,
+          canonicalSlug: parsedHint.canonicalSlug,
+          rawInput: token,
+          isSyncing: true,
+        });
+      }
+
       const res = await RtSiagaStorage.acceptCommunityInvite(token);
       if (cancelled) return;
       if (res.ok && res.community) {
+        setPendingRtSync(null);
         setAutoJoinedBanner({
           communityName: res.community.profile.orgName,
           inviter: res.inviter || 'Pengurus',
@@ -385,7 +409,18 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
         if (!fromCarryover) {
           showNotification(res.message);
         }
+      } else if (res.pendingSync) {
+        setPendingRtSync({
+          title: res.pendingSync.title,
+          canonicalSlug: res.pendingSync.canonicalSlug,
+          rawInput: res.pendingSync.rawInput,
+          isSyncing: false,
+        });
+        if (!fromCarryover) {
+          showNotification(res.message);
+        }
       } else if (!fromCarryover) {
+        setPendingRtSync(null);
         showNotification(res.message);
       }
     };
@@ -403,17 +438,68 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     };
   }, [showNotification]);
 
-  // Generate compact invite token & short 1-2 line URL when invite modal opens
+  // Listen for live P2P snapshot when waiting for sync
+  useEffect(() => {
+    if (!pendingRtSync) return;
+    const ch = getSyncChannelName('rt', pendingRtSync.canonicalSlug);
+    window.dispatchEvent(
+      new CustomEvent(RELAY_REGISTER_CHANNELS_EVENT, { detail: { channels: [ch] } })
+    );
+    const onRelay = (ev: Event) => {
+      const d = (ev as CustomEvent<{
+        channel?: string;
+        eventName?: string;
+        payload?: { snapshot?: string };
+      }>).detail;
+      if (!d || d.channel !== ch || d.eventName !== 'sync:snapshot' || !d.payload?.snapshot) return;
+      void RtSiagaStorage.acceptCommunityInvite(d.payload.snapshot).then((res) => {
+        if (res.ok && res.community) {
+          setPendingRtSync(null);
+          setAutoJoinedBanner({
+            communityName: res.community.profile.orgName,
+            inviter: res.inviter || 'Pengurus',
+            orgType: res.community.profile.orgType,
+          });
+          setActiveTab('ringkasan');
+          setIsPengurusMode(false);
+          showNotification(res.message);
+        }
+      });
+    };
+    window.addEventListener(REALTIME_RELAY_EVENT_NAME, onRelay as EventListener);
+    return () => window.removeEventListener(REALTIME_RELAY_EVENT_NAME, onRelay as EventListener);
+  }, [pendingRtSync, showNotification]);
+
+  // Background publish active community snapshot so title link stays ready even if host closes app
+  useEffect(() => {
+    if (!activeCommunity) return;
+    const timer = window.setTimeout(() => {
+      void RtSiagaStorage.publishCommunitySnapshot(activeCommunity, currentUser.name);
+    }, 1100);
+    return () => window.clearTimeout(timer);
+  }, [activeCommunity, currentUser.name]);
+
+  // Generate title-only invite link immediately & publish snapshot for sync on entry
   useEffect(() => {
     let cancelled = false;
     if (activeSheet === 'undang_komunitas' && activeCommunity) {
-      setShortInviteUrl('');
+      const { url } = InviteRelayService.buildTitleInviteUrl(
+        'rt',
+        activeCommunity.profile.orgName,
+        activeCommunity.profile.orgType
+      );
+      setShortInviteUrl(url);
+
       RtSiagaStorage.encodeCommunityInviteCompact(activeCommunity, currentUser.name)
         .then(async tok => {
           if (cancelled) return;
           setCompactInviteToken(tok);
-          const res = await InviteRelayService.createShortInviteLink('R', 'rt', tok);
-          if (!cancelled) setShortInviteUrl(res.url);
+          await InviteRelayService.publishRoomSnapshot({
+            kind: 'rt',
+            title: activeCommunity.profile.orgName,
+            inviter: currentUser.name || activeCommunity.profile.creatorName || 'Pengurus',
+            snapshot: tok,
+          });
         })
         .catch(async () => {
           if (cancelled) return;
@@ -422,8 +508,12 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
             currentUser.name
           );
           setCompactInviteToken(fallback);
-          const res = await InviteRelayService.createShortInviteLink('R', 'rt', fallback);
-          if (!cancelled) setShortInviteUrl(res.url);
+          await InviteRelayService.publishRoomSnapshot({
+            kind: 'rt',
+            title: activeCommunity.profile.orgName,
+            inviter: currentUser.name || activeCommunity.profile.creatorName || 'Pengurus',
+            snapshot: fallback,
+          });
         });
     } else {
       setCompactInviteToken('');
@@ -637,24 +727,20 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     const last4 = updatedMember.phone.replace(/\D/g, '').slice(-4) || '0000';
     let shareUrlLine = '';
     if (activeCommunity) {
-      try {
-        const token = await RtSiagaStorage.encodeCommunityInviteCompact(
-          activeCommunity,
-          currentUser.name,
-          updatedMember
-        );
-        const res = await InviteRelayService.createShortInviteLink('R', 'rt', token);
-        shareUrlLine = `\n👉 Klik Link Auto-Gabung (Otomatis masuk & klaim data Anda):\n${res.url}\n`;
-      } catch {
-        // ignore compact url error
-      }
+      const { url } = InviteRelayService.buildTitleInviteUrl(
+        'rt',
+        activeCommunity.profile.orgName,
+        activeCommunity.profile.orgType
+      );
+      shareUrlLine = `\n👉 Klik Link Judul (Sinkronisasi saat masuk):\n${url}\n`;
+      void RtSiagaStorage.publishCommunitySnapshot(activeCommunity, currentUser.name);
     }
-    const inviteText = `Halo Bpk/Ibu ${updatedMember.name} (${updatedMember.block}),\nAnda diundang bergabung di ${brandTitle} (${profile.orgName}) tahun ${profile.year}.\n${shareUrlLine}\nJika masuk manual lewat menu ${brandTitle}:\n• Kode Klaim: ${code}\n• Verifikasi 4 digit terakhir No HP: ${last4}\n\nTerima kasih,\n${profile.orgName}`;
+    const inviteText = `Halo Bpk/Ibu ${updatedMember.name} (${updatedMember.block}),\nAnda diundang bergabung di ${brandTitle} (${profile.orgName}) tahun ${profile.year}.\n${shareUrlLine}\nUntuk klaim profil Anda:\n• Kode Klaim: ${code}\n• Verifikasi 4 digit terakhir No HP: ${last4}\n\nTerima kasih,\n${profile.orgName}`;
 
     if (navigator.clipboard) {
       try {
         await navigator.clipboard.writeText(inviteText);
-        showNotification(`Link auto-gabung & undangan WA untuk ${updatedMember.name} disalin!`);
+        showNotification(`Link judul & undangan WA untuk ${updatedMember.name} disalin!`);
         return;
       } catch {
         // fallback notification
@@ -663,16 +749,27 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     showNotification(`Status ${updatedMember.name} ditandai Terundang (Kode: ${code}).`);
   };
 
-  const handleJoinByInviteInput = async (e?: React.FormEvent) => {
+  const handleJoinByInviteInput = async (e?: React.FormEvent, overrideRaw?: string) => {
     if (e) e.preventDefault();
-    if (!inviteJoinInput.trim()) {
-      showNotification('Tempel link undangan (?rt=...) atau token WQR2_ dari pengurus.');
+    const rawToUse = (overrideRaw ?? inviteJoinInput).trim();
+    if (!rawToUse) {
+      showNotification('Tempel link judul (?rt=... / ?paguyuban=...) atau judul komunitas.');
       return;
     }
     setIsJoiningInvite(true);
+    const parsedHint = parseInviteInput(rawToUse, 'rt');
+    if (parsedHint?.mode === 'room_slug') {
+      setPendingRtSync({
+        title: parsedHint.titleGuess,
+        canonicalSlug: parsedHint.canonicalSlug,
+        rawInput: rawToUse,
+        isSyncing: true,
+      });
+    }
     try {
-      const res = await RtSiagaStorage.acceptCommunityInvite(inviteJoinInput);
+      const res = await RtSiagaStorage.acceptCommunityInvite(rawToUse);
       if (res.ok && res.community) {
+        setPendingRtSync(null);
         setInviteJoinInput('');
         setAutoJoinedBanner({
           communityName: res.community.profile.orgName,
@@ -682,7 +779,16 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
         setActiveTab('ringkasan');
         setIsPengurusMode(false);
         showNotification(res.message);
+      } else if (res.pendingSync) {
+        setPendingRtSync({
+          title: res.pendingSync.title,
+          canonicalSlug: res.pendingSync.canonicalSlug,
+          rawInput: res.pendingSync.rawInput,
+          isSyncing: false,
+        });
+        showNotification(res.message);
       } else {
+        setPendingRtSync(null);
         showNotification(res.message);
       }
     } finally {
@@ -751,7 +857,13 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
 
   const communityInviteUrl =
     shortInviteUrl ||
-    (compactInviteToken ? `${window.location.origin}/?rt=${compactInviteToken}` : '');
+    (activeCommunity
+      ? InviteRelayService.buildTitleInviteUrl(
+          'rt',
+          activeCommunity.profile.orgName,
+          activeCommunity.profile.orgType
+        ).url
+      : '');
 
   return (
     <div className="w-full h-full bg-white overflow-hidden flex flex-col relative select-none text-slate-800">
@@ -909,15 +1021,60 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
       {/* 2. MAIN CONTENT BY TAB (MINIMALIST LIST VIEW + HAIRLINE DIVIDERS)     */}
       {/* ===================================================================== */}
       <main className="flex-1 overflow-y-auto no-scrollbar bg-white">
+        {pendingRtSync && (
+          <div className="mx-4 mt-3 px-3.5 py-2.5 rounded-xl border border-amber-300 bg-amber-50 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <RefreshCw
+                className={`w-4 h-4 text-amber-800 shrink-0 ${
+                  pendingRtSync.isSyncing ? 'animate-spin' : ''
+                }`}
+              />
+              <div className="text-xs text-slate-900 min-w-0">
+                <div className="font-bold truncate">
+                  {pendingRtSync.isSyncing
+                    ? `Menyinkronkan "${pendingRtSync.title}"...`
+                    : `Menunggu Sinkronisasi "${pendingRtSync.title}"`}
+                </div>
+                <p className="text-[11px] text-slate-600">
+                  {pendingRtSync.isSyncing
+                    ? 'Mengambil data komunitas terbaru saat masuk.'
+                    : 'Otomatis masuk saat perangkat pengurus membuka WargaQu, atau tekan Sinkronkan Ulang.'}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              {!pendingRtSync.isSyncing && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleJoinByInviteInput(undefined, pendingRtSync.rawInput);
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-bold whitespace-nowrap"
+                >
+                  Sinkronkan Ulang
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setPendingRtSync(null)}
+                className="p-1 text-slate-500 hover:text-slate-800"
+                title="Tutup"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {autoJoinedBanner && (
           <div className="mx-4 mt-3 px-3.5 py-2.5 rounded-xl border border-emerald-300 bg-emerald-50 flex items-start justify-between gap-2">
             <div className="text-xs text-emerald-950 space-y-0.5">
               <div className="font-bold flex items-center gap-1.5">
                 <Sparkles className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
-                <span>Otomatis Masuk {autoJoinedBanner.communityName}</span>
+                <span>Sinkronisasi &amp; Masuk {autoJoinedBanner.communityName}</span>
               </div>
               <p className="text-[11px] text-emerald-800">
-                Diundang oleh <strong>{autoJoinedBanner.inviter}</strong> ({autoJoinedBanner.orgType}). Data komunitas ini tersimpan aman di HP Anda.
+                Diundang oleh <strong>{autoJoinedBanner.inviter}</strong> ({autoJoinedBanner.orgType}). Data komunitas ini tersinkron &amp; tersimpan aman di HP Anda.
               </p>
             </div>
             <button
@@ -957,7 +1114,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                     <span>Punya Undangan dari Pengurus?</span>
                   </h3>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Tempel link undangan (?rt=...) atau kode token (WQR2_...) untuk langsung bergabung.
+                    Tempel link judul (?rt=..., ?paguyuban=...), ketik nama RT/Paguyuban, atau kode offline.
                   </p>
                 </div>
               </div>
@@ -966,7 +1123,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                   type="text"
                   value={inviteJoinInput}
                   onChange={e => setInviteJoinInput(e.target.value)}
-                  placeholder="Tempel link ?rt=WQR2_... atau kode token"
+                  placeholder="Contoh: ?rt=RT-03-Melati atau ?paguyuban=..."
                   className="flex-1 min-h-[42px] border border-slate-300 rounded-xl px-3 text-xs focus:outline-none focus:border-emerald-700"
                 />
                 <button
@@ -2987,24 +3144,24 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                 </form>
               )}
 
-              {/* SHEET: BAGIKAN LINK UNDANGAN KOMUNITAS (?rt=WQR2_...) */}
+              {/* SHEET: BAGIKAN LINK JUDUL KOMUNITAS (SINKRONISASI SAAT MASUK) */}
               {activeSheet === 'undang_komunitas' && activeCommunity && (
                 <div className="space-y-3">
                   <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-1">
                     <div className="font-extrabold text-emerald-900 text-xs">
-                      Undangan Otomatis (Zero Server DB)
+                      Link Judul Komunitas (Sinkronisasi Saat Masuk)
                     </div>
                     <p className="text-[11px] text-emerald-800 leading-relaxed">
-                      Warga yang mengklik link ini akan <strong>otomatis membuka {profile.orgName}</strong> di HP masing-masing tanpa melihat data RT/komunitas lain. Untuk warga yang sudah Anda daftarkan di tab Pengurus → Warga, gunakan tombol <strong>Undang WA</strong> agar data blok & iurannya ikut terbawa.
+                      Link hanya memuat judul <strong>{profile.orgName}</strong> agar ringkas dan mudah dibaca. Saat warga mengklik link, data komunitas otomatis disinkronkan ke HP masing-masing (tanpa DB server).
                     </p>
                   </div>
 
                   <div className="space-y-1.5">
                     <label className="font-bold text-slate-700 block">
-                      Link Undangan Praktis (?rt=...)
+                      Link Judul ({brandTitle})
                     </label>
-                    <div className="p-2.5 rounded-xl border border-slate-200 bg-slate-50 font-mono text-[10px] text-slate-700 break-all max-h-24 overflow-y-auto">
-                      {communityInviteUrl || 'Menyiapkan link terkompresi...'}
+                    <div className="p-2.5 rounded-xl border border-slate-200 bg-slate-50 font-mono text-[11px] text-slate-800 break-all">
+                      {communityInviteUrl}
                     </div>
                   </div>
 
@@ -3016,15 +3173,15 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                         if (!communityInviteUrl) return;
                         try {
                           await navigator.clipboard.writeText(communityInviteUrl);
-                          showNotification('Link undangan (?rt=...) disalin!');
+                          showNotification('Link judul komunitas disalin!');
                         } catch {
                           showNotification('Gagal menyalin link.');
                         }
                       }}
-                      className="w-full min-h-[42px] bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-xl font-bold flex items-center justify-center gap-1.5"
+                      className="w-full min-h-[44px] bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-xl font-bold flex items-center justify-center gap-1.5"
                     >
                       <Copy className="w-4 h-4" />
-                      <span>Salin Link Undangan (?rt=...)</span>
+                      <span>Salin Link Judul</span>
                     </button>
 
                     <button
@@ -3032,7 +3189,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                       disabled={!communityInviteUrl}
                       onClick={async () => {
                         if (!communityInviteUrl) return;
-                        const waText = `Halo Bpk/Ibu/Rekan,\nMari bergabung ke grup digital *${profile.orgName}* (${brandTitle}) di aplikasi WargaQu untuk info warga, forum, iuran transparan & keamanan SiagaQu.\n\n👉 Klik link undangan ini (otomatis masuk):\n${communityInviteUrl}\n\nSalam,\n${currentUser.name}`;
+                        const waText = `Halo Bpk/Ibu/Rekan,\nMari bergabung ke grup digital *${profile.orgName}* (${brandTitle}) di aplikasi WargaQu untuk info warga, forum, iuran transparan & keamanan SiagaQu.\n\n👉 Klik link judul (sinkronisasi saat masuk):\n${communityInviteUrl}\n\nSalam,\n${currentUser.name}`;
                         try {
                           await navigator.clipboard.writeText(waText);
                           showNotification('Pesan undangan WhatsApp disalin!');
@@ -3040,7 +3197,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                           showNotification('Gagal menyalin pesan WA.');
                         }
                       }}
-                      className="w-full min-h-[42px] border border-emerald-700 text-emerald-700 hover:bg-emerald-50 rounded-xl font-bold flex items-center justify-center gap-1.5"
+                      className="w-full min-h-[44px] border border-emerald-700 text-emerald-700 hover:bg-emerald-50 rounded-xl font-bold flex items-center justify-center gap-1.5"
                     >
                       <Share2 className="w-4 h-4" />
                       <span>Salin Pesan Undangan Grup WA</span>
@@ -3052,14 +3209,14 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
                         onClick={async () => {
                           try {
                             await navigator.clipboard.writeText(compactInviteToken);
-                            showNotification('Token undangan (WQR2_...) disalin!');
+                            showNotification('Kode cadangan offline disalin!');
                           } catch {
-                            showNotification('Gagal menyalin token.');
+                            showNotification('Gagal menyalin kode.');
                           }
                         }}
-                        className="w-full min-h-[38px] border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-xl font-bold text-[11px]"
+                        className="w-full min-h-[40px] border border-slate-300 text-slate-700 hover:bg-slate-50 rounded-xl font-bold text-[11px]"
                       >
-                        Salin Kode Token Saja (Untuk Tempel Manual)
+                        Salin Kode Offline Saja (Jika Tanpa Jaringan)
                       </button>
                     )}
                   </div>

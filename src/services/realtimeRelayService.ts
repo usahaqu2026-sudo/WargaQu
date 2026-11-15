@@ -1,4 +1,10 @@
 import { AuthService } from './authService';
+import {
+  canonicalInviteSlug,
+  getSyncChannelName,
+  RELAY_PUBLISH_CMD_EVENT,
+  RELAY_REGISTER_CHANNELS_EVENT,
+} from './inviteRelayService';
 import { RT_SYNC_EVENT, RtSiagaStorage } from './rtSiagaStorage';
 import { SIAGA_CIRCLE_SYNC_EVENT, SiagaCircleService } from './siagaCircleService';
 
@@ -66,6 +72,7 @@ class RealtimeRelayManager {
   private reconnectAttempt = 0;
   private outbox: QueuedOutbound[] = [];
   private started = false;
+  private extraChannels = new Set<string>();
 
   getStatus(): RelayConnectionState {
     return this.status;
@@ -76,13 +83,36 @@ class RealtimeRelayManager {
     return `rt:${normalizeChannelPart(profile.orgName)}`;
   }
 
+  registerChannels(channels: string[]) {
+    let added = false;
+    for (const ch of channels) {
+      const clean = (ch || '').trim();
+      if (clean && !this.extraChannels.has(clean)) {
+        this.extraChannels.add(clean);
+        added = true;
+      }
+    }
+    if (added) {
+      this.joinCurrentChannels();
+    }
+  }
+
   getSubscribedChannels(): string[] {
     const channels = new Set<string>(['admin:policy', this.getRtChannel()]);
+    const communities = RtSiagaStorage.getCommunities();
+    for (const comm of communities) {
+      if (comm?.profile?.orgName) {
+        channels.add(getSyncChannelName('rt', comm.profile.orgName));
+      }
+    }
     const circles = SiagaCircleService.getCircles();
     for (const c of circles) {
       if (c.inviteCode) {
         channels.add(`circle:${c.inviteCode.toUpperCase()}`);
       }
+    }
+    for (const extra of this.extraChannels) {
+      channels.add(extra);
     }
     return Array.from(channels);
   }
@@ -101,6 +131,40 @@ class RealtimeRelayManager {
       this.started = true;
       window.addEventListener(RT_SYNC_EVENT, () => this.joinCurrentChannels());
       window.addEventListener(SIAGA_CIRCLE_SYNC_EVENT, () => this.joinCurrentChannels());
+      window.addEventListener(RELAY_REGISTER_CHANNELS_EVENT, ((ev: CustomEvent<{ channels?: string[] }>) => {
+        if (Array.isArray(ev.detail?.channels)) {
+          this.registerChannels(ev.detail.channels);
+        }
+      }) as EventListener);
+      window.addEventListener(
+        RELAY_PUBLISH_CMD_EVENT,
+        ((ev: CustomEvent<{ channel?: string; eventName?: string; payload?: unknown }>) => {
+          if (ev.detail?.channel && ev.detail?.eventName) {
+            this.publish(ev.detail.channel, ev.detail.eventName, ev.detail.payload);
+          }
+        }) as EventListener
+      );
+      window.addEventListener(REALTIME_RELAY_EVENT, ((ev: CustomEvent<RelayIncomingEvent>) => {
+        const d = ev.detail;
+        if (!d || d.eventName !== 'sync:request' || !d.channel?.startsWith('sync:rt:')) return;
+        const requestedSlug = d.channel.slice('sync:rt:'.length);
+        const match = RtSiagaStorage.getCommunities().find(
+          (c) => canonicalInviteSlug(c.profile.orgName) === requestedSlug
+        );
+        if (!match) return;
+        const acc = AuthService.getAccount();
+        const inviter = acc ? AuthService.getDisplayName(acc) : match.profile.creatorName || 'Pengurus';
+        void RtSiagaStorage.encodeCommunityInviteCompact(match, inviter).then((snapshot) => {
+          this.publish(d.channel, 'sync:snapshot', {
+            kind: 'rt',
+            slug: requestedSlug,
+            title: match.profile.orgName,
+            inviter,
+            snapshot,
+            updatedAt: Date.now(),
+          });
+        });
+      }) as EventListener);
     }
     this.connect();
   }

@@ -89,12 +89,17 @@ export default function App() {
     const extractInviteFromLocation = () => {
       try {
         const params = new URLSearchParams(window.location.search);
-        const fromQuery = params.get('t') || params.get('trah') || params.get('trahInvite');
+        const trahVal = params.get('trah');
+        if (trahVal && trahVal.trim()) return `?trah=${trahVal.trim()}`;
+        const fromQuery = params.get('t') || params.get('trahInvite');
         if (fromQuery && fromQuery.trim()) return fromQuery.trim();
+        const pathMatch = window.location.pathname.match(/^\/trah\/([^/?#]+)/i);
+        if (pathMatch?.[1]) return `?trah=${decodeURIComponent(pathMatch[1]).trim()}`;
         const hash = window.location.hash || '';
-        const tIdx = hash.indexOf('t=');
+        const tIdx = hash.search(/(?:trah|t)=/);
         if (tIdx !== -1) {
           const hp = new URLSearchParams(hash.slice(tIdx));
+          if (hp.get('trah')?.trim()) return `?trah=${hp.get('trah')!.trim()}`;
           const fromHash = hp.get('t') || hp.get('trahInvite');
           if (fromHash && fromHash.trim()) return fromHash.trim();
         }
@@ -107,14 +112,30 @@ export default function App() {
     const extractRtInviteFromLocation = () => {
       try {
         const params = new URLSearchParams(window.location.search);
-        const fromQuery = params.get('rt') || params.get('rtInvite');
-        if (fromQuery && fromQuery.trim()) return fromQuery.trim();
+        const pagVal = params.get('paguyuban');
+        if (pagVal && pagVal.trim()) return `?paguyuban=${pagVal.trim()}`;
+        const grupVal = params.get('grup') || params.get('organisasi') || params.get('sosial');
+        if (grupVal && grupVal.trim()) return `?grup=${grupVal.trim()}`;
+        const rtVal = params.get('rt') || params.get('rtInvite');
+        if (rtVal && rtVal.trim()) {
+          const v = rtVal.trim();
+          return v.startsWith('WQR') || /^R[A-Za-z0-9]{5,12}$/.test(v) ? v : `?rt=${v}`;
+        }
+        const pathMatch = window.location.pathname.match(/^\/(rt|paguyuban|grup)\/([^/?#]+)/i);
+        if (pathMatch?.[2]) {
+          return `?${pathMatch[1].toLowerCase()}=${decodeURIComponent(pathMatch[2]).trim()}`;
+        }
         const hash = window.location.hash || '';
-        const rtIdx = hash.indexOf('rt=');
+        const rtIdx = hash.search(/(?:rt|paguyuban|grup)=/);
         if (rtIdx !== -1) {
           const hp = new URLSearchParams(hash.slice(rtIdx));
+          if (hp.get('paguyuban')?.trim()) return `?paguyuban=${hp.get('paguyuban')!.trim()}`;
+          if (hp.get('grup')?.trim()) return `?grup=${hp.get('grup')!.trim()}`;
           const fromHash = hp.get('rt') || hp.get('rtInvite');
-          if (fromHash && fromHash.trim()) return fromHash.trim();
+          if (fromHash && fromHash.trim()) {
+            const v = fromHash.trim();
+            return v.startsWith('WQR') || /^R[A-Za-z0-9]{5,12}$/.test(v) ? v : `?rt=${v}`;
+          }
         }
       } catch {
         // ignore URL errors
@@ -128,11 +149,11 @@ export default function App() {
       if (trahInvite) {
         localStorage.setItem('wargaqu_pending_trah_invite_v1', trahInvite);
         setCurrentScreen('leluhurqu');
-        window.history.replaceState({ screen: 'leluhurqu' }, '', `${window.location.pathname}#leluhurqu`);
+        window.history.replaceState({ screen: 'leluhurqu' }, '', `/#leluhurqu`);
       } else if (rtInvite) {
         localStorage.setItem('wargaqu_pending_rt_invite_v1', rtInvite);
         setCurrentScreen('rtqu');
-        window.history.replaceState({ screen: 'rtqu' }, '', `${window.location.pathname}#rtqu`);
+        window.history.replaceState({ screen: 'rtqu' }, '', `/#rtqu`);
       }
     } catch {
       // ignore URL/storage errors

@@ -1,5 +1,5 @@
 import { AuthAccount, AuthService } from './authService';
-import { InviteRelayService } from './inviteRelayService';
+import { InviteRelayService, parseInviteInput } from './inviteRelayService';
 
 export type OrgType = 'RT' | 'Paguyuban' | 'Organisasi' | 'Sosial';
 export type SiagaActivationStatus = 'pending' | 'active' | 'suspended';
@@ -911,7 +911,24 @@ function extractRtRawToken(rawInput: string): string {
 export async function decodeRtInviteInputAsync(
   rawInput: string
 ): Promise<DecodedRtInvitePayload | null> {
-  const resolved = await InviteRelayService.resolveInviteTokenIfShort(rawInput);
+  const parsedHint = parseInviteInput(rawInput, 'rt');
+  let resolved = rawInput;
+  if (parsedHint?.mode === 'short_code') {
+    resolved = await InviteRelayService.resolveInviteTokenIfShort(rawInput);
+  } else if (parsedHint?.mode === 'room_slug') {
+    const syncRes = await InviteRelayService.syncRoomOnEntry({
+      kind: 'rt',
+      slugOrTitle: parsedHint.canonicalSlug,
+    });
+    if (syncRes.ok && syncRes.snapshot) {
+      resolved = syncRes.snapshot;
+    } else {
+      return null;
+    }
+  } else {
+    resolved = await InviteRelayService.resolveInviteTokenIfShort(rawInput);
+  }
+
   const token = extractRtRawToken(resolved);
   if (!token) return null;
 
@@ -1098,7 +1115,9 @@ export const RtSiagaStorage = {
     community?: RtCommunityWorkspace;
     inviter?: string;
     needsClaim?: boolean;
+    pendingSync?: { title: string; canonicalSlug: string; rawInput: string };
   }> {
+    const parsedHint = parseInviteInput(rawInput, 'rt');
     const decoded = await decodeRtInviteInputAsync(rawInput);
     const { acc } = getCurrentAccountScope();
     const todayLabel = new Date().toLocaleDateString('id-ID', {
@@ -1108,9 +1127,20 @@ export const RtSiagaStorage = {
     });
 
     if (!decoded) {
+      if (parsedHint?.mode === 'room_slug') {
+        return {
+          ok: false,
+          message: `Ruang "${parsedHint.titleGuess}" belum merespons sinkronisasi. Pastikan HP pengurus sedang membuka WargaQu atau tekan Sinkronkan Ulang.`,
+          pendingSync: {
+            title: parsedHint.titleGuess,
+            canonicalSlug: parsedHint.canonicalSlug,
+            rawInput,
+          },
+        };
+      }
       return {
         ok: false,
-        message: 'Link atau kode undangan komunitas (?rt=... / WQR2_ / WQR1:) tidak valid.',
+        message: 'Link judul atau kode undangan komunitas tidak valid.',
       };
     }
 
@@ -1238,6 +1268,20 @@ export const RtSiagaStorage = {
     targetMember?: WargaMember
   ): Promise<string> {
     return encodeRtInviteTokenCompact(ws, inviterName, targetMember);
+  },
+
+  async publishCommunitySnapshot(ws: RtCommunityWorkspace, inviterName: string): Promise<void> {
+    try {
+      const snapshot = await encodeRtInviteTokenCompact(ws, inviterName);
+      await InviteRelayService.publishRoomSnapshot({
+        kind: 'rt',
+        title: ws.profile.orgName,
+        inviter: inviterName || ws.profile.creatorName || 'Pengurus',
+        snapshot,
+      });
+    } catch {
+      // ignore background publish errors
+    }
   },
 
   getProfile(): PaguyubanProfile {

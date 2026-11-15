@@ -71,7 +71,14 @@ import { AUTH_SYNC_EVENT, AuthService } from '../../services/authService';
 import { LeluhurBookModal } from './LeluhurBookModal';
 import { MonetizationService } from '../../services/monetizationService';
 import { ModularFeeSheet } from '../monetization/ModularFeeSheet';
-import { InviteRelayService } from '../../services/inviteRelayService';
+import {
+  canonicalInviteSlug,
+  getSyncChannelName,
+  InviteRelayService,
+  parseInviteInput,
+  REALTIME_RELAY_EVENT_NAME,
+  RELAY_REGISTER_CHANNELS_EVENT,
+} from '../../services/inviteRelayService';
 
 export interface SpouseInfo {
   id: string;
@@ -381,7 +388,23 @@ function extractRawTokenFromInput(rawInput: string): string {
 async function decodeTrahInviteInputAsync(
   rawInput: string
 ): Promise<{ trah: TrahCategory; inviter: string } | null> {
-  const resolvedInput = await InviteRelayService.resolveInviteTokenIfShort(rawInput);
+  const parsedHint = parseInviteInput(rawInput, 'trah');
+  let resolvedInput = rawInput;
+  if (parsedHint?.mode === 'short_code') {
+    resolvedInput = await InviteRelayService.resolveInviteTokenIfShort(rawInput);
+  } else if (parsedHint?.mode === 'room_slug') {
+    const syncRes = await InviteRelayService.syncRoomOnEntry({
+      kind: 'trah',
+      slugOrTitle: parsedHint.canonicalSlug,
+    });
+    if (syncRes.ok && syncRes.snapshot) {
+      resolvedInput = syncRes.snapshot;
+    } else {
+      return null;
+    }
+  } else {
+    resolvedInput = await InviteRelayService.resolveInviteTokenIfShort(rawInput);
+  }
   const token = extractRawTokenFromInput(resolvedInput);
   if (!token) return null;
 
@@ -1517,6 +1540,12 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     inviter: string;
     memberCount: number;
   } | null>(null);
+  const [pendingTrahSync, setPendingTrahSync] = useState<{
+    title: string;
+    canonicalSlug: string;
+    rawInput: string;
+    isSyncing: boolean;
+  } | null>(null);
 
   // Log Aktivitas & Navigasi langsung ke Tab Pengaturan
   const [activityLogs, setActivityLogs] = useState<LeluhurActivityLog[]>(() =>
@@ -1738,12 +1767,35 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     rawTokenOrUrl: string,
     autoFromLink = false
   ): Promise<boolean> => {
+    const parsedHint = parseInviteInput(rawTokenOrUrl, 'trah');
+    if (parsedHint?.mode === 'room_slug') {
+      setPendingTrahSync({
+        title: parsedHint.titleGuess,
+        canonicalSlug: parsedHint.canonicalSlug,
+        rawInput: rawTokenOrUrl,
+        isSyncing: true,
+      });
+    }
+
     const decoded = await decodeTrahInviteInputAsync(rawTokenOrUrl);
     if (!decoded) {
-      showNotification('Kode atau link undangan Trah tidak valid.');
+      if (parsedHint?.mode === 'room_slug') {
+        setPendingTrahSync({
+          title: parsedHint.titleGuess,
+          canonicalSlug: parsedHint.canonicalSlug,
+          rawInput: rawTokenOrUrl,
+          isSyncing: false,
+        });
+        showNotification(
+          `Menunggu sinkronisasi "${parsedHint.titleGuess}". Pastikan perangkat keluarga sedang membuka WargaQu lalu tekan Sinkronkan Ulang.`
+        );
+      } else {
+        showNotification('Kode atau link undangan Trah tidak valid.');
+      }
       return false;
     }
 
+    setPendingTrahSync(null);
     const { trah: rawInvited, inviter } = decoded;
     const normalizedInvited: TrahCategory = {
       ...rawInvited,
@@ -1791,17 +1843,17 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       trahName: normalizedInvited.name,
       actionType: 'invite_join',
       targetName: normalizedInvited.name,
-      summary: `Otomatis masuk ke Trah "${normalizedInvited.name}" via undangan ${inviter}`,
+      summary: `Sinkronisasi & masuk Trah "${normalizedInvited.name}" via undangan ${inviter}`,
       details: `${normalizedInvited.members.length} anggota silsilah dimuat ke akun ${targetScope.email || 'tamu'}.`,
     });
 
     showNotification(
-      `Otomatis masuk Trah "${normalizedInvited.name}" dari ${inviter} (${normalizedInvited.members.length} anggota)!`
+      `Sinkronisasi selesai! Masuk Trah "${normalizedInvited.name}" (${normalizedInvited.members.length} anggota).`
     );
     return true;
   };
 
-  // Proses otomatis undangan Trah yang masuk lewat URL (?t=... / ?trahInvite=...)
+  // Proses otomatis undangan Trah yang masuk lewat URL (?trah=Nama-Trah / ?t=...)
   useEffect(() => {
     const checkAndProcessInvite = async () => {
       try {
@@ -1829,20 +1881,93 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
     return () => window.removeEventListener('wargaqu-trah-invite-arrived', checkAndProcessInvite);
   }, [accountScope.scopeKey]);
 
-  // Hasilkan token ringkas & link 1-2 baris (?t=Qxxxxxx) saat modal undangan dibuka
+  // Daftarkan channel sinkronisasi untuk semua Trah milik akun ini & jawab sync:request real-time
+  useEffect(() => {
+    if (trahList.length === 0 && !pendingTrahSync) return;
+    const channels = trahList.map((t) => getSyncChannelName('trah', t.name));
+    if (pendingTrahSync) {
+      channels.push(getSyncChannelName('trah', pendingTrahSync.canonicalSlug));
+    }
+    window.dispatchEvent(
+      new CustomEvent(RELAY_REGISTER_CHANNELS_EVENT, { detail: { channels } })
+    );
+
+    const onRelaySync = (ev: Event) => {
+      const detail = (ev as CustomEvent<{
+        channel?: string;
+        eventName?: string;
+        payload?: { snapshot?: string; title?: string; inviter?: string };
+      }>).detail;
+      if (!detail || !detail.channel?.startsWith('sync:trah:')) return;
+      const requestedSlug = detail.channel.slice('sync:trah:'.length);
+
+      if (detail.eventName === 'sync:request') {
+        const match = trahList.find((t) => canonicalInviteSlug(t.name) === requestedSlug);
+        if (!match) return;
+        void encodeTrahInviteTokenCompact(match, accountProfile.displayName || 'Keluarga').then(
+          (snapshot) => {
+            void InviteRelayService.publishRoomSnapshot({
+              kind: 'trah',
+              title: match.name,
+              inviter: accountProfile.displayName || 'Keluarga',
+              snapshot,
+            });
+          }
+        );
+      } else if (
+        detail.eventName === 'sync:snapshot' &&
+        pendingTrahSync &&
+        pendingTrahSync.canonicalSlug === requestedSlug &&
+        detail.payload?.snapshot
+      ) {
+        void handleAcceptTrahInvite(detail.payload.snapshot, true);
+      }
+    };
+
+    window.addEventListener(REALTIME_RELAY_EVENT_NAME, onRelaySync as EventListener);
+    return () => {
+      window.removeEventListener(REALTIME_RELAY_EVENT_NAME, onRelaySync as EventListener);
+    };
+  }, [trahList, pendingTrahSync, accountProfile.displayName]);
+
+  // Sinkronisasi cadangan otomatis ke RAM transit saat daftar Trah berubah (agar link judul selalu siap meski host tutup HP)
+  useEffect(() => {
+    if (trahList.length === 0) return;
+    const timer = window.setTimeout(() => {
+      for (const trah of trahList.slice(0, 6)) {
+        void encodeTrahInviteTokenCompact(trah, accountProfile.displayName || 'Keluarga').then(
+          (snapshot) => {
+            void InviteRelayService.publishRoomSnapshot({
+              kind: 'trah',
+              title: trah.name,
+              inviter: accountProfile.displayName || 'Keluarga',
+              snapshot,
+            });
+          }
+        );
+      }
+    }, 1100);
+    return () => window.clearTimeout(timer);
+  }, [trahList, accountProfile.displayName]);
+
+  // Hasilkan link judul (?trah=Nama-Trah) instan & kirim snapshot untuk sinkronisasi saat masuk
   useEffect(() => {
     if (!isInviteModalOpen || trahList.length === 0) return;
     let cancelled = false;
-    setShortInviteUrl('');
     const target = inviteTrahTarget || activeTrah;
+    const { url } = InviteRelayService.buildTitleInviteUrl('trah', target.name);
+    setShortInviteUrl(url);
+
     encodeTrahInviteTokenCompact(target, accountProfile.displayName || 'Keluarga').then(
       async (tok) => {
         if (cancelled) return;
         setCompactInviteToken(tok);
-        const res = await InviteRelayService.createShortInviteLink('Q', 't', tok);
-        if (!cancelled) {
-          setShortInviteUrl(res.url);
-        }
+        await InviteRelayService.publishRoomSnapshot({
+          kind: 'trah',
+          title: target.name,
+          inviter: accountProfile.displayName || 'Keluarga',
+          snapshot: tok,
+        });
       }
     );
     return () => {
@@ -3510,6 +3635,53 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
       </div>
 
       {/* ========================================================= */}
+      {/* BANNER PROSES / TUNGGU SINKRONISASI SAAT MASUK VIA LINK   */}
+      {/* ========================================================= */}
+      {pendingTrahSync && (
+        <div className="bg-amber-50 text-stone-900 px-3 py-2.5 border-b border-amber-200 flex flex-wrap items-center justify-between gap-2 text-xs z-20 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-7 h-7 rounded-lg bg-amber-200 text-amber-900 flex items-center justify-center shrink-0">
+              <RefreshCw className={`w-4 h-4 ${pendingTrahSync.isSyncing ? 'animate-spin' : ''}`} />
+            </div>
+            <div className="min-w-0">
+              <p className="font-extrabold text-xs truncate">
+                {pendingTrahSync.isSyncing
+                  ? `Menyinkronkan "${pendingTrahSync.title}"...`
+                  : `Menunggu Sinkronisasi "${pendingTrahSync.title}"`}
+              </p>
+              <p className="text-[10px] text-stone-600 truncate">
+                {pendingTrahSync.isSyncing
+                  ? 'Mengambil data silsilah terbaru saat masuk.'
+                  : 'Otomatis masuk begitu perangkat keluarga membuka WargaQu, atau tekan Sinkronkan Ulang.'}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            {!pendingTrahSync.isSyncing && (
+              <button
+                type="button"
+                onClick={() => {
+                  void handleAcceptTrahInvite(pendingTrahSync.rawInput, true);
+                }}
+                className="px-2.5 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white font-bold text-[11px] flex items-center gap-1 transition"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>Sinkronkan Ulang</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setPendingTrahSync(null)}
+              className="p-1 rounded-lg hover:bg-amber-200/60 text-stone-600"
+              title="Tutup"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
       {/* BANNER SELAMAT DATANG AUTO-MASUK VIA LINK UNDANGAN        */}
       {/* ========================================================= */}
       {autoJoinedBanner && trahList.length > 0 && (
@@ -3520,7 +3692,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
             </div>
             <div className="min-w-0">
               <p className="font-extrabold text-xs truncate">
-                Otomatis masuk ke Trah &ldquo;{autoJoinedBanner.trahName}&rdquo;
+                Sinkronisasi &amp; Masuk Trah &ldquo;{autoJoinedBanner.trahName}&rdquo;
               </p>
               <p className="text-[10px] text-emerald-100 truncate">
                 Undangan dari {autoJoinedBanner.inviter} • {autoJoinedBanner.memberCount} anggota silsilah siap diklaim.
@@ -3606,7 +3778,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                     type="text"
                     value={inviteJoinInput}
                     onChange={(e) => setInviteJoinInput(e.target.value)}
-                    placeholder="Tempel link (?t=...) atau kode LQH2_ / LQH1:..."
+                    placeholder="Tempel link (?trah=Nama-Trah), judul trah, atau kode offline..."
                     className="flex-1 min-w-0 px-3 py-2 text-xs bg-white border border-stone-300 rounded-xl focus:border-emerald-600 outline-hidden"
                   />
                   <button
@@ -5784,10 +5956,9 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                 accountProfile.displayName || 'Keluarga'
               );
               const activeToken = compactInviteToken || fallbackToken;
-              const inviteLink =
-                shortInviteUrl ||
-                `${window.location.origin}/?t=${encodeURIComponent(activeToken)}`;
-              const inviteText = `Undangan Silsilah *${target.name}* (${target.members.length} anggota) di LeluhurQu.\nKlik link otomatis masuk:\n${inviteLink}`;
+              const titleLinkObj = InviteRelayService.buildTitleInviteUrl('trah', target.name);
+              const inviteLink = shortInviteUrl || titleLinkObj.url;
+              const inviteText = `Undangan Silsilah *${target.name}* (${target.members.length} anggota) di LeluhurQu.\nKlik link judul (sinkronisasi saat masuk):\n${inviteLink}`;
 
               const recordShareLog = (channel: string) => {
                 appendActivityLog({
@@ -5796,25 +5967,25 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                   actionType: 'invite_share',
                   targetName: channel,
                   summary: `Membagikan link undangan Trah "${target.name}" via ${channel}`,
-                  details: `${target.members.length} anggota disertakan dalam link undangan.`,
+                  details: `${target.members.length} anggota disertakan untuk sinkronisasi saat masuk.`,
                 });
               };
 
               return (
                 <>
-                  {/* Link Singkat Auto-Masuk */}
+                  {/* Link Judul Trah (Sinkronisasi Saat Masuk) */}
                   <div className="bg-emerald-50/70 p-3 rounded-2xl border border-emerald-200 space-y-2">
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[10px] font-extrabold text-emerald-900 uppercase tracking-wider flex items-center gap-1">
                         <Link2 className="w-3.5 h-3.5 text-emerald-700" />
-                        <span>Link Pendek Auto-Masuk (1–2 Baris)</span>
+                        <span>Link Judul Trah (Sinkronisasi Saat Masuk)</span>
                       </span>
                       <button
                         type="button"
                         onClick={() => {
                           navigator.clipboard.writeText(activeToken);
                           recordShareLog('Salin Kode Offline');
-                          showNotification('Kode offline lengkap disalin! 📋');
+                          showNotification('Kode offline lengkap disalin!');
                         }}
                         className="text-[10px] font-bold text-emerald-800 hover:underline"
                       >
@@ -5826,7 +5997,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                       <input
                         type="text"
                         readOnly
-                        value={shortInviteUrl ? inviteLink : 'Membuat link pendek...'}
+                        value={inviteLink}
                         onClick={(e) => (e.target as HTMLInputElement).select()}
                         className="flex-1 min-w-0 px-2.5 py-1.5 text-[11px] font-mono bg-white border border-emerald-300 rounded-xl text-stone-700 outline-hidden select-all"
                       />
@@ -5835,7 +6006,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                         onClick={() => {
                           navigator.clipboard.writeText(inviteLink);
                           recordShareLog('Salin Link');
-                          showNotification('Link pendek undangan Trah disalin! 🔗');
+                          showNotification('Link judul Trah disalin!');
                         }}
                         className="px-3 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-extrabold text-[11px] shrink-0 transition"
                       >
@@ -5844,7 +6015,7 @@ export const LeluhurQuView: React.FC<LeluhurQuViewProps> = ({
                     </div>
 
                     <p className="text-[10px] text-emerald-800 leading-snug">
-                      ✨ Link dipendekkan jadi 1–2 baris lewat relay sementara (tanpa DB server). Penerima klik link langsung otomatis masuk ke Trah <strong>{target.name}</strong>.
+                      Link hanya menampilkan judul <strong>{target.name}</strong>. Saat keluarga membuka link, data silsilah otomatis disinkronkan langsung (tanpa DB server).
                     </p>
                   </div>
 

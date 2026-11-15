@@ -51,6 +51,18 @@ async function startServer() {
   let volatileAccountPolicies: unknown = null;
   const volatileFrozenDeviceMasks = new Set<string>();
   const volatileInviteTickets = new Map<string, { payload: string; expiresAt: number }>();
+  const volatileInviteRooms = new Map<
+    string,
+    {
+      kind: 'trah' | 'rt';
+      slug: string;
+      title: string;
+      inviter: string;
+      snapshot: string;
+      updatedAt: number;
+      expiresAt: number;
+    }
+  >();
   const volatilePresenceMap = new Map<
     string,
     { data: Record<string, unknown>; lastSeenMs: number }
@@ -85,6 +97,16 @@ async function startServer() {
       const oldestKey = volatileInviteTickets.keys().next().value;
       if (!oldestKey) break;
       volatileInviteTickets.delete(oldestKey);
+    }
+    for (const [k, v] of volatileInviteRooms.entries()) {
+      if (v.expiresAt <= now) {
+        volatileInviteRooms.delete(k);
+      }
+    }
+    while (volatileInviteRooms.size > MAX_VOLATILE_TICKETS) {
+      const oldestKey = volatileInviteRooms.keys().next().value;
+      if (!oldestKey) break;
+      volatileInviteRooms.delete(oldestKey);
     }
   }
 
@@ -293,6 +315,71 @@ async function startServer() {
     res.json({ payload: entry.payload });
   });
 
+  // Ephemeral RAM-only Title Room Transit (sync on entry via readable title slug, zero DB/disk)
+  app.post('/api/invite-room', (req, res) => {
+    const body = req.body as {
+      kind?: unknown;
+      slug?: unknown;
+      title?: unknown;
+      inviter?: unknown;
+      snapshot?: unknown;
+    };
+    const kind = body?.kind === 'rt' ? 'rt' : body?.kind === 'trah' ? 'trah' : null;
+    const rawSlug = typeof body?.slug === 'string' ? body.slug.trim().toLowerCase() : '';
+    const canonicalSlug = rawSlug.replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+    const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 120) : canonicalSlug;
+    const inviter = typeof body?.inviter === 'string' ? body.inviter.trim().slice(0, 80) : 'WargaQu';
+    const snapshot = typeof body?.snapshot === 'string' ? body.snapshot.trim() : '';
+
+    if (!kind || !canonicalSlug || !snapshot || snapshot.length > 220000) {
+      res.status(400).json({ error: 'Invalid room snapshot' });
+      return;
+    }
+
+    pruneExpiredTickets();
+    const roomKey = `${kind}:${canonicalSlug}`;
+    const updatedAt = Date.now();
+    volatileInviteRooms.set(roomKey, {
+      kind,
+      slug: canonicalSlug,
+      title,
+      inviter,
+      snapshot,
+      updatedAt,
+      expiresAt: updatedAt + TICKET_TTL_MS,
+    });
+    res.json({ ok: true, roomKey, slug: canonicalSlug, updatedAt });
+  });
+
+  app.get('/api/invite-room/:kind/:slug', (req, res) => {
+    pruneExpiredTickets();
+    const kind = req.params.kind === 'rt' ? 'rt' : req.params.kind === 'trah' ? 'trah' : null;
+    const canonicalSlug = String(req.params.slug || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 64);
+    if (!kind || !canonicalSlug) {
+      res.status(400).json({ error: 'Invalid room key' });
+      return;
+    }
+    const entry = volatileInviteRooms.get(`${kind}:${canonicalSlug}`);
+    if (!entry) {
+      res.status(404).json({ error: 'Room snapshot not active yet' });
+      return;
+    }
+    res.json({
+      found: true,
+      kind: entry.kind,
+      slug: entry.slug,
+      title: entry.title,
+      inviter: entry.inviter,
+      snapshot: entry.snapshot,
+      updatedAt: entry.updatedAt,
+    });
+  });
+
   // Ephemeral RAM-only active presence snapshot for Admin Zero Trust live monitoring
   app.get('/api/relay-presence', (_req, res) => {
     pruneExpiredPresence();
@@ -312,7 +399,7 @@ async function startServer() {
       citizenDatabaseStorage: 'none',
       connectedClients: clients.size,
       activeChannels: channelSubscribers.size,
-      activeTransitTickets: volatileInviteTickets.size,
+      activeTransitTickets: volatileInviteTickets.size + volatileInviteRooms.size,
       activePresenceRamCount: volatilePresenceMap.size,
     });
   });
