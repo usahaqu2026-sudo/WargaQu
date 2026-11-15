@@ -33,8 +33,10 @@ import {
   AlertTriangle,
   BadgeCheck,
   Navigation,
-  Edit3
+  Edit3,
+  HelpCircle
 } from 'lucide-react';
+import { ModuleOnboardingService } from '../../services/moduleOnboardingService';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { MenuItem } from '../../types';
@@ -1521,6 +1523,16 @@ export const AreaQuView: React.FC<AreaQuViewProps> = ({
             </div>
           </div>
           <span className="text-[10px] font-bold text-emerald-300 shrink-0">Setel</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => ModuleOnboardingService.openGuide('areaqu')}
+          className="w-10 h-10 rounded-full bg-white/15 hover:bg-white/25 text-white flex items-center justify-center active:scale-95 transition shrink-0"
+          title="Panduan & Manfaat AreaQu"
+          aria-label="Panduan AreaQu"
+        >
+          <HelpCircle className="w-5 h-5" />
         </button>
 
         <button

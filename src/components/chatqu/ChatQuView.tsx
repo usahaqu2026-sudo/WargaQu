@@ -24,8 +24,10 @@ import {
   X,
   Megaphone,
   Bell,
-  Plus
+  Plus,
+  HelpCircle
 } from 'lucide-react';
+import { ModuleOnboardingService } from '../../services/moduleOnboardingService';
 import { AuthService } from '../../services/authService';
 import {
   REALTIME_RELAY_EVENT,
@@ -470,6 +472,15 @@ export const ChatQuView: React.FC<ChatQuViewProps> = ({
               title="Cari Percakapan"
             >
               <Search className="w-4 h-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => ModuleOnboardingService.openGuide('chatqu')}
+              className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-300 hover:text-white transition"
+              title="Panduan & Manfaat ChatQu"
+              aria-label="Panduan ChatQu"
+            >
+              <HelpCircle className="w-4 h-4" />
             </button>
             <button
               onClick={() => showNotification('Menu: Setelan Notifikasi RT 03')}

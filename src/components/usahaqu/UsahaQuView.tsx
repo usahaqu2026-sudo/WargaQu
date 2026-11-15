@@ -7,8 +7,10 @@ import {
   Sparkles,
   Store,
   ChevronRight,
-  Headphones
+  Headphones,
+  HelpCircle
 } from 'lucide-react';
+import { ModuleOnboardingService } from '../../services/moduleOnboardingService';
 
 import { HeaderBar } from '../HeaderBar';
 import { NavigationDrawer } from '../NavigationDrawer';
@@ -483,6 +485,15 @@ export const UsahaQuView: React.FC<UsahaQuViewProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => ModuleOnboardingService.openGuide('usahaqu')}
+              className="w-7 h-7 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 flex items-center justify-center border border-zinc-700 active:scale-95"
+              title="Panduan & Manfaat UsahaQu / ModularQu"
+              aria-label="Panduan UsahaQu"
+            >
+              <HelpCircle className="w-3.5 h-3.5 text-emerald-400" />
+            </button>
             {onOpenBantuan && (
               <button
                 onClick={onOpenBantuan}
@@ -541,6 +552,15 @@ export const UsahaQuView: React.FC<UsahaQuViewProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => ModuleOnboardingService.openGuide('usahaqu')}
+            className="w-7 h-7 rounded-xl bg-emerald-950/80 hover:bg-emerald-950 text-[#5eead4] border border-[#5eead4]/40 flex items-center justify-center font-bold shadow-xs active:scale-95"
+            title="Panduan & Manfaat UsahaQu / Resto Qu"
+            aria-label="Panduan UsahaQu"
+          >
+            <HelpCircle className="w-3.5 h-3.5 text-[#5eead4]" />
+          </button>
           {onOpenBantuan && (
             <button
               onClick={onOpenBantuan}

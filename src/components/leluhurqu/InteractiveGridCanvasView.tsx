@@ -92,6 +92,7 @@ export interface InteractiveNode {
   y: number;
   photo: string;
   wafat: boolean;
+  gender?: 'L' | 'P';
   memberId?: string;
   groupId?: string;
   customBgColor?: string;
@@ -135,6 +136,15 @@ export interface SavedGridDesign {
 export interface InteractiveGridCanvasViewProps {
   activeTrah: TrahCategory;
   onOpenTable?: () => void;
+  onSyncMember?: (
+    memberId: string,
+    patch: {
+      name?: string;
+      gender?: 'L' | 'P';
+      isDeceased?: boolean;
+      photoUrl?: string;
+    }
+  ) => void;
   showNotification: (msg: string) => void;
   defaultCuratorName?: string;
   defaultCreatedYear?: string;
@@ -294,8 +304,9 @@ function buildQuickTextFromTrah(members: FamilyMember[]): string {
       );
       return list
         .map((m) => {
+          const primaryLabel = m.gender === 'P' ? `${m.name} (P)` : m.name;
           const spNames = (m.spouses || []).map((s) => s.name).filter(Boolean);
-          return [m.name, ...spNames].join(' + ');
+          return [primaryLabel, ...spNames].join(' + ');
         })
         .join(', ');
     })
@@ -347,6 +358,7 @@ function buildCanvasFromTrah(
             (rowIdx === 0 ? 'Leluhur Inti' : `Generasi ${rowIdx + 1}`),
           photo: m.photoUrl || '',
           wafat: m.isDeceased,
+          gender: m.gender as 'L' | 'P' | undefined,
         },
         ...(m.spouses || []).map((sp) => ({
           name: sp.name,
@@ -359,6 +371,7 @@ function buildCanvasFromTrah(
           })`,
           photo: '',
           wafat: sp.status === 'cerai_mati',
+          gender: (m.gender === 'L' ? 'P' : m.gender === 'P' ? 'L' : undefined) as 'L' | 'P' | undefined,
         })),
       ];
 
@@ -391,6 +404,7 @@ function buildCanvasFromTrah(
           y: posY,
           photo: person.photo,
           wafat: person.wafat,
+          gender: person.gender,
           memberId: pIdx === 0 ? m.id : undefined,
         });
 
@@ -904,6 +918,7 @@ function reconcileCanvasWithMembers(
         n.sub !== nextSub ||
         n.photo !== nextPhoto ||
         n.wafat !== m.isDeceased ||
+        n.gender !== m.gender ||
         n.genLevel !== m.generationLevel
       ) {
         changed = true;
@@ -913,6 +928,7 @@ function reconcileCanvasWithMembers(
           sub: nextSub,
           photo: nextPhoto,
           wafat: m.isDeceased,
+          gender: m.gender,
           genLevel: m.generationLevel,
         };
       }
@@ -1040,6 +1056,7 @@ function reconcileCanvasWithMembers(
         y: spot.y,
         photo: m.photoUrl || '',
         wafat: m.isDeceased,
+        gender: m.gender,
         genLevel: m.generationLevel,
       };
       updatedNodes.push(newNode);
@@ -1069,6 +1086,7 @@ function reconcileCanvasWithMembers(
             y: spSpot.y,
             photo: '',
             wafat: sp.status === 'cerai_mati',
+            gender: m.gender === 'L' ? 'P' : m.gender === 'P' ? 'L' : undefined,
             genLevel: m.generationLevel,
           });
           occupied.push({ x: spSpot.x, y: spSpot.y, w: sampleDim.w, h: sampleDim.h });
@@ -1089,7 +1107,7 @@ function reconcileCanvasWithMembers(
 
 export const InteractiveGridCanvasView: React.FC<
   InteractiveGridCanvasViewProps
-> = ({ activeTrah, onOpenTable, showNotification, defaultCuratorName = '', defaultCreatedYear = '' }) => {
+> = ({ activeTrah, onOpenTable, onSyncMember, showNotification, defaultCuratorName = '', defaultCreatedYear = '' }) => {
   // Mode Layout & Interaksi
   const [layoutMode, setLayoutMode] = useState<GridLayoutMode>('manual');
   const [isMultiSelectMode, setIsMultiSelectMode] = useState<boolean>(false);
@@ -1273,7 +1291,7 @@ export const InteractiveGridCanvasView: React.FC<
     members
       .map(
         (m) =>
-          `${m.id}:${m.name}:${m.callName || ''}:${m.birthYear || ''}:${m.deathYear || ''}:${m.isDeceased ? 1 : 0}:${m.photoUrl || ''}:${m.parentId || ''}:${m.generationLevel}:${(m.spouses || []).map((s) => s.name).join('|')}`
+          `${m.id}:${m.name}:${m.gender}:${m.callName || ''}:${m.birthYear || ''}:${m.deathYear || ''}:${m.isDeceased ? 1 : 0}:${m.photoUrl || ''}:${m.parentId || ''}:${m.generationLevel}:${(m.spouses || []).map((s) => s.name).join('|')}`
       )
       .join(';');
 
@@ -1857,10 +1875,20 @@ export const InteractiveGridCanvasView: React.FC<
             .filter(Boolean);
           let firstInGroup: string | null = null;
 
-          couple.forEach((personName, pIdx) => {
+          couple.forEach((rawPersonName, pIdx) => {
             const id = 'n_' + idCounter++;
             if (pIdx === 0) firstInGroup = id;
             if (itemIndex === 0 && pIdx === 0) currentGenMainId = id;
+
+            let cleanName = rawPersonName;
+            let parsedGender: 'L' | 'P' | undefined;
+            if (/\((P|Pr|Perempuan|Wanita|Perp|F)\)/i.test(cleanName)) {
+              parsedGender = 'P';
+              cleanName = cleanName.replace(/\((P|Pr|Perempuan|Wanita|Perp|F)\)/i, '').trim();
+            } else if (/\((L|Lk|Laki|Laki-laki|Pria|M)\)/i.test(cleanName)) {
+              parsedGender = 'L';
+              cleanName = cleanName.replace(/\((L|Lk|Laki|Laki-laki|Pria|M)\)/i, '').trim();
+            }
 
             const colIdx = itemIndex % maxCols;
             const actualRowOffset = Math.floor(itemIndex / maxCols);
@@ -1874,11 +1902,11 @@ export const InteractiveGridCanvasView: React.FC<
             const posX = startX + colIdx * 175;
             const posY = startY + rowIdx * rowHeight + actualRowOffset * 130;
 
-            const prev = prevByName.get(personName.toLowerCase());
+            const prev = prevByName.get(cleanName.toLowerCase());
 
             nextNodes.push({
               id,
-              name: personName,
+              name: cleanName,
               sub:
                 prev?.sub ||
                 (rowIdx === 0 ? 'Leluhur Inti' : `Generasi ${rowIdx + 1}`),
@@ -1886,6 +1914,8 @@ export const InteractiveGridCanvasView: React.FC<
               y: posY,
               photo: prev?.photo || '',
               wafat: prev?.wafat || false,
+              gender: parsedGender ?? prev?.gender,
+              memberId: prev?.memberId,
             });
 
             if (pIdx > 0 && firstInGroup) {
@@ -2941,11 +2971,35 @@ export const InteractiveGridCanvasView: React.FC<
   const updateSelectedField = (patch: Partial<InteractiveNode>) => {
     if (selectedIds.length === 0) return;
     const selSet = new Set(selectedIds);
-    const nextNodes = nodes.map((n) =>
-      selSet.has(n.id) ? { ...n, ...patch } : n
-    );
+    const syncedMemberIds: string[] = [];
+    const nextNodes = nodes.map((n) => {
+      if (!selSet.has(n.id)) return n;
+      if (n.memberId) syncedMemberIds.push(n.memberId);
+      return { ...n, ...patch };
+    });
     setNodes(nextNodes);
     persistCurrentDesign(nextNodes, edges);
+
+    if (
+      onSyncMember &&
+      syncedMemberIds.length > 0 &&
+      (patch.name !== undefined ||
+        patch.gender !== undefined ||
+        patch.wafat !== undefined ||
+        patch.photo !== undefined)
+    ) {
+      const memberPatch: {
+        name?: string;
+        gender?: 'L' | 'P';
+        isDeceased?: boolean;
+        photoUrl?: string;
+      } = {};
+      if (patch.name !== undefined) memberPatch.name = patch.name;
+      if (patch.gender !== undefined) memberPatch.gender = patch.gender;
+      if (patch.wafat !== undefined) memberPatch.isDeceased = patch.wafat;
+      if (patch.photo !== undefined) memberPatch.photoUrl = patch.photo;
+      syncedMemberIds.forEach((mId) => onSyncMember(mId, memberPatch));
+    }
   };
 
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -4458,6 +4512,42 @@ export const InteractiveGridCanvasView: React.FC<
 
                       <div>
                         <label className="text-[10px] font-bold opacity-75 block mb-1">
+                          Jenis Kelamin
+                        </label>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => updateSelectedField({ gender: 'L' })}
+                            className={`py-1.5 px-2 rounded-lg border text-[11px] font-bold flex items-center justify-center gap-1 transition ${
+                              (primarySelectedNode.gender || 'L') === 'L'
+                                ? 'bg-sky-500 text-slate-950 border-sky-400 shadow-xs'
+                                : isDark
+                                ? 'bg-[#0f172a] border-slate-700 text-slate-300'
+                                : 'bg-stone-50 border-stone-300 text-stone-700'
+                            }`}
+                          >
+                            <span>👨</span>
+                            <span>Pria (L)</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => updateSelectedField({ gender: 'P' })}
+                            className={`py-1.5 px-2 rounded-lg border text-[11px] font-bold flex items-center justify-center gap-1 transition ${
+                              primarySelectedNode.gender === 'P'
+                                ? 'bg-rose-500 text-white border-rose-400 shadow-xs'
+                                : isDark
+                                ? 'bg-[#0f172a] border-slate-700 text-slate-300'
+                                : 'bg-stone-50 border-stone-300 text-stone-700'
+                            }`}
+                          >
+                            <span>👩</span>
+                            <span>Wanita (P)</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="text-[10px] font-bold opacity-75 block mb-1">
                           Keterangan (Tahun / Kota)
                         </label>
                         <input
@@ -5105,9 +5195,14 @@ export const InteractiveGridCanvasView: React.FC<
                     {cardDisplayMode === 'name_only' && (
                       <div
                         style={{ fontSize: `${scaledNamePx}px` }}
-                        className="font-extrabold leading-tight truncate w-full"
+                        className="font-extrabold leading-tight truncate w-full flex items-center justify-center gap-1"
                       >
-                        {node.name}
+                        {node.gender && (
+                          <span className="shrink-0 opacity-90">
+                            {node.gender === 'P' ? '👩' : '👨'}
+                          </span>
+                        )}
+                        <span className="truncate">{node.name}</span>
                       </div>
                     )}
 
@@ -5143,6 +5238,9 @@ export const InteractiveGridCanvasView: React.FC<
                           style={{ fontSize: `${scaledNamePx}px` }}
                           className="font-bold leading-tight break-words w-full"
                         >
+                          {node.gender && (
+                            <span className="mr-0.5">{node.gender === 'P' ? '👩' : '👨'}</span>
+                          )}
                           {node.name}
                         </div>
                         {node.sub && (

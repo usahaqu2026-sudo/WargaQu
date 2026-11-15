@@ -24,8 +24,10 @@ import {
   Store,
   Phone,
   CreditCard,
-  QrCode
+  QrCode,
+  HelpCircle
 } from 'lucide-react';
+import { ModuleOnboardingService } from '../../services/moduleOnboardingService';
 import { MenuItem } from '../../types';
 import { StorageService } from '../../services/storage';
 import { AUTH_SYNC_EVENT, AuthService } from '../../services/authService';
@@ -593,6 +595,17 @@ export const MuamalahQuView: React.FC<MuamalahQuViewProps> = ({
             title="Pengaturan Toko"
           >
             <Settings className="w-5 h-5 text-white" />
+          </button>
+
+          {/* Guide Button */}
+          <button
+            type="button"
+            onClick={() => ModuleOnboardingService.openGuide('muamalahqu')}
+            className="p-1.5 hover:bg-black/10 rounded-full active:scale-95 transition"
+            title="Panduan & Manfaat MuamalahQu"
+            aria-label="Panduan MuamalahQu"
+          >
+            <HelpCircle className="w-5 h-5 text-white" />
           </button>
         </div>
 

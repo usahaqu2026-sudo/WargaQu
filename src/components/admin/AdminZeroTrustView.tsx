@@ -16,6 +16,8 @@ import {
   RefreshCw,
   KeyRound,
   AlertTriangle,
+  Headphones,
+  Users,
 } from 'lucide-react';
 import { AuthService } from '../../services/authService';
 import { RtSiagaStorage } from '../../services/rtSiagaStorage';
@@ -37,13 +39,27 @@ import {
   DeveloperSettlement,
   FeeMode,
 } from '../../services/monetizationService';
+import { SMART_CARE_SYNC_EVENT, SmartCareService } from '../../services/smartCareService';
+import { SmartCareAdminTriagePanel } from '../bantuan/SmartCareAdminTriagePanel';
+import {
+  ACCOUNT_GOV_SYNC_EVENT,
+  AccountGovernanceService,
+} from '../../services/accountGovernanceService';
+import { AccountGovernancePanel } from './AccountGovernancePanel';
 
 interface AdminZeroTrustViewProps {
   onBack: () => void;
   showNotification: (msg: string) => void;
 }
 
-type AdminTab = 'statistik' | 'monetisasi' | 'qris_dev' | 'hp_hilang' | 'zero_trust';
+type AdminTab =
+  | 'statistik'
+  | 'akun_modul'
+  | 'smart_care'
+  | 'monetisasi'
+  | 'qris_dev'
+  | 'hp_hilang'
+  | 'zero_trust';
 
 export const AdminZeroTrustView: React.FC<AdminZeroTrustViewProps> = ({
   onBack,
@@ -81,6 +97,10 @@ export const AdminZeroTrustView: React.FC<AdminZeroTrustViewProps> = ({
   const [auditLogs, setAuditLogs] = useState<ZeroTrustAuditEntry[]>(() =>
     ZeroTrustService.getAuditLogs()
   );
+  const [newSmartCareCount, setNewSmartCareCount] = useState<number>(
+    () => SmartCareService.getLogs().filter(l => l.triageStatus === 'new').length
+  );
+  const [govTick, setGovTick] = useState<number>(0);
 
   // Local editing states
   const [settlementRefInput, setSettlementRefInput] = useState<string>('');
@@ -100,19 +120,41 @@ export const AdminZeroTrustView: React.FC<AdminZeroTrustViewProps> = ({
       setDevices(ZeroTrustService.getDevices());
       setRecoveryRequests(ZeroTrustService.getRecoveryRequests());
       setAuditLogs(ZeroTrustService.getAuditLogs());
+      setNewSmartCareCount(
+        SmartCareService.getLogs().filter(l => l.triageStatus === 'new').length
+      );
+      setGovTick(t => t + 1);
     };
     window.addEventListener(ZERO_TRUST_SYNC_EVENT, refreshAll);
     window.addEventListener(MONETIZATION_SYNC_EVENT, refreshAll);
+    window.addEventListener(SMART_CARE_SYNC_EVENT, refreshAll);
+    window.addEventListener(ACCOUNT_GOV_SYNC_EVENT, refreshAll);
     return () => {
       window.removeEventListener(ZERO_TRUST_SYNC_EVENT, refreshAll);
       window.removeEventListener(MONETIZATION_SYNC_EVENT, refreshAll);
+      window.removeEventListener(SMART_CARE_SYNC_EVENT, refreshAll);
+      window.removeEventListener(ACCOUNT_GOV_SYNC_EVENT, refreshAll);
     };
   }, []);
+
+  useEffect(() => {
+    if (isUnlocked) {
+      AccountGovernanceService.fetchVolatileServerPresence().catch(() => {});
+    }
+  }, [isUnlocked]);
 
   const summary = useMemo(() => MonetizationService.getSummary(), [ledger, rules]);
   const rtMembers = useMemo(() => RtSiagaStorage.getMembers(), [isUnlocked]);
   const rtLogs = useMemo(() => RtSiagaStorage.getAuditLogs(), [isUnlocked]);
   const siagaCircles = useMemo(() => SiagaCircleService.getCircles(), [isUnlocked]);
+  const knownAccounts = useMemo(
+    () => AccountGovernanceService.getCombinedKnownAccounts(),
+    [isUnlocked, govTick]
+  );
+  const moduleAccountStats = useMemo(
+    () => AccountGovernanceService.getModuleAccountStats(),
+    [knownAccounts]
+  );
 
   const handleUnlockSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -319,6 +361,19 @@ export const AdminZeroTrustView: React.FC<AdminZeroTrustViewProps> = ({
         {(
           [
             { id: 'statistik', label: 'Statistik', icon: BarChart3 },
+            {
+              id: 'akun_modul',
+              label: `Akun & Akses (${knownAccounts.length})`,
+              icon: Users,
+            },
+            {
+              id: 'smart_care',
+              label:
+                newSmartCareCount > 0
+                  ? `Smart Care (${newSmartCareCount})`
+                  : 'Smart Care',
+              icon: Headphones,
+            },
             { id: 'monetisasi', label: 'Monetisasi', icon: SlidersHorizontal },
             { id: 'qris_dev', label: 'QRIS Dev', icon: QrCode },
             {
@@ -416,6 +471,44 @@ export const AdminZeroTrustView: React.FC<AdminZeroTrustViewProps> = ({
               </div>
             </section>
 
+            {/* Per-Module Active/Registered Account Summary */}
+            <section className="p-4 space-y-2.5 bg-slate-50/50">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs font-extrabold text-slate-900">
+                    Akun Terdaftar / Aktif Per Modul
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    {knownAccounts.length} akun terpantau ·{' '}
+                    {knownAccounts.filter(a => a.isOnlineNow).length} live online
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('akun_modul')}
+                  className="min-h-[30px] px-2.5 bg-slate-900 text-white rounded-lg text-[10px] font-bold shrink-0"
+                >
+                  Atur Free / Warning / Ban →
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {moduleAccountStats.map(st => (
+                  <div
+                    key={st.moduleId}
+                    className="bg-white border border-slate-200 rounded-xl px-3 py-2 flex items-center justify-between gap-1.5"
+                  >
+                    <span className="text-[11px] font-bold text-slate-800 truncate">
+                      {st.label}
+                    </span>
+                    <span className="text-[11px] font-extrabold font-mono text-emerald-700 shrink-0">
+                      {st.registeredCount}
+                      {st.onlineNowCount > 0 ? ` (${st.onlineNowCount} live)` : ''}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </section>
+
             {/* Per-Module Breakdown Chart */}
             <section className="p-4 space-y-3">
               <h3 className="text-xs font-extrabold text-slate-900">
@@ -498,8 +591,19 @@ export const AdminZeroTrustView: React.FC<AdminZeroTrustViewProps> = ({
         {activeTab === 'monetisasi' && (
           <div className="divide-y divide-slate-200">
             <div className="p-4 bg-slate-50 text-[11px] text-slate-600 leading-relaxed space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-extrabold text-slate-900">
+                  Status Global:{' '}
+                  {MonetizationService.isAnyRuleEnabled() ? (
+                    <span className="text-emerald-700">AKTIF (Tampil di Modul Terpilih)</span>
+                  ) : (
+                    <span className="text-slate-600">HIDDEN / NONAKTIF (Tersembunyi dari Semua User)</span>
+                  )}
+                </span>
+              </div>
               <div>
-                Aktifkan atau matikan monetisasi per modul secara independen. Tarif flat berkisar antara{' '}
+                Aktifkan atau matikan monetisasi per modul secara independen. Saat OFF, semua
+                biaya &amp; popup monetisasi otomatis disembunyikan dari warga. Tarif flat berkisar antara{' '}
                 <span className="font-bold text-slate-900 font-mono">Rp 2.000 – Rp 30.000</span> atau{' '}
                 <span className="font-bold text-slate-900">1% akumulasi transaksi</span>.
               </div>
@@ -1110,6 +1214,18 @@ export const AdminZeroTrustView: React.FC<AdminZeroTrustViewProps> = ({
                 ))
               )}
             </section>
+          </div>
+        )}
+
+        {/* TAB: AKUN & AKSES MODULAR (FREE / WARNING / BANNED & KOMUNITAS) */}
+        {activeTab === 'akun_modul' && (
+          <AccountGovernancePanel showNotification={showNotification} />
+        )}
+
+        {/* TAB: SMART CARE LOG & PROMPT TRIAGE */}
+        {activeTab === 'smart_care' && (
+          <div className="p-4">
+            <SmartCareAdminTriagePanel showNotification={showNotification} lightTheme />
           </div>
         )}
       </main>

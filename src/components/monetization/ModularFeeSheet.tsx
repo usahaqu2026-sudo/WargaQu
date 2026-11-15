@@ -31,6 +31,7 @@ export const ModularFeeSheet: React.FC<ModularFeeSheetProps> = ({
   if (!isOpen) return null;
 
   const calc = MonetizationService.calculateFee(moduleId, grossAmount);
+  if (!calc.enabled || calc.feeAmount <= 0) return null;
   const qrisCfg = MonetizationService.getQrisConfig();
 
   const handleConfirm = () => {

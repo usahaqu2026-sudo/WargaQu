@@ -1,4 +1,5 @@
 import { AuthAccount, AuthService } from './authService';
+import { InviteRelayService } from './inviteRelayService';
 
 export type OrgType = 'RT' | 'Paguyuban' | 'Organisasi' | 'Sosial';
 export type SiagaActivationStatus = 'pending' | 'active' | 'suspended';
@@ -910,7 +911,8 @@ function extractRtRawToken(rawInput: string): string {
 export async function decodeRtInviteInputAsync(
   rawInput: string
 ): Promise<DecodedRtInvitePayload | null> {
-  const token = extractRtRawToken(rawInput);
+  const resolved = await InviteRelayService.resolveInviteTokenIfShort(rawInput);
+  const token = extractRtRawToken(resolved);
   if (!token) return null;
 
   if (token.startsWith('WQR2_')) {

@@ -1,6 +1,7 @@
 import { AuthService } from './authService';
 import { ZeroTrustService } from './zeroTrustService';
 import { RealtimeRelayService } from './realtimeRelayService';
+import { AccountGovernanceService } from './accountGovernanceService';
 
 export type MonetizableModuleId =
   | 'areaqu_lapak'
@@ -57,7 +58,7 @@ export interface DeveloperSettlement {
   settledAt: string;
 }
 
-const RULES_KEY = 'wargaqu_monetize_rules_v1';
+const RULES_KEY = 'wargaqu_monetize_rules_v2';
 const QRIS_CFG_KEY = 'wargaqu_dev_qris_cfg_v1';
 const LEDGER_KEY = 'wargaqu_monetize_ledger_v1';
 const SETTLEMENTS_KEY = 'wargaqu_monetize_settlements_v1';
@@ -77,7 +78,7 @@ const DEFAULT_RULES: ModuleMonetizationRule[] = [
     moduleName: 'AreaQu (Sewa Lapak & Radar)',
     triggerLabel: 'Terbitkan / Perpanjang Lapak di Peta',
     description: 'Biaya tayang lapak warga di peta radius AreaQu (Rp 2.000 – Rp 30.000 atau 1% order).',
-    enabled: true,
+    enabled: false,
     feeMode: 'flat',
     flatFee: 15000,
     percentRate: 1,
@@ -87,7 +88,7 @@ const DEFAULT_RULES: ModuleMonetizationRule[] = [
     moduleName: 'LeluhurQu (Print & Download)',
     triggerLabel: 'Cetak Poster A0-A4, Buku PDF & Ekspor Data',
     description: 'Biaya cetak/download paket dokumen silsilah keluarga beresolusi tinggi.',
-    enabled: true,
+    enabled: false,
     feeMode: 'flat',
     flatFee: 10000,
     percentRate: 1,
@@ -97,7 +98,7 @@ const DEFAULT_RULES: ModuleMonetizationRule[] = [
     moduleName: 'RTQu (Bayar Iuran Warga)',
     triggerLabel: 'Pembayaran Iuran Bulanan & Kas RT',
     description: 'Akumulasi platform 1% per transaksi iuran atau tarif flat Rp 2.000 – Rp 30.000.',
-    enabled: true,
+    enabled: false,
     feeMode: 'percent_1',
     flatFee: 2500,
     percentRate: 1,
@@ -107,7 +108,7 @@ const DEFAULT_RULES: ModuleMonetizationRule[] = [
     moduleName: 'MuamalahQu (Marketplace)',
     triggerLabel: 'Checkout Pesanan Warga',
     description: 'Akumulasi komisi 1% dari total belanja atau biaya layanan flat per checkout.',
-    enabled: true,
+    enabled: false,
     feeMode: 'percent_1',
     flatFee: 2000,
     percentRate: 1,
@@ -179,6 +180,10 @@ export const MonetizationService = {
     return this.getRules().find(r => r.moduleId === moduleId) || DEFAULT_RULES[0];
   },
 
+  isAnyRuleEnabled(): boolean {
+    return this.getRules().some(r => r.enabled);
+  },
+
   updateRule(
     moduleId: MonetizableModuleId,
     patch: Partial<ModuleMonetizationRule>
@@ -244,6 +249,15 @@ export const MonetizationService = {
     rule: ModuleMonetizationRule;
   } {
     const rule = this.getRule(moduleId);
+    const govFree = AccountGovernanceService.isCurrentUserFreeForModule(moduleId);
+    if (govFree.free) {
+      return {
+        enabled: false,
+        feeAmount: 0,
+        label: govFree.reason || 'Gratis (Akses Free Admin / Komunitas)',
+        rule,
+      };
+    }
     if (!rule.enabled) {
       return { enabled: false, feeAmount: 0, label: 'Gratis (Monetisasi OFF)', rule };
     }
@@ -267,6 +281,8 @@ export const MonetizationService = {
 
   // Unlock tracking for pass-based modules (AreaQu Sewa Lapak & LeluhurQu Print/Download)
   hasActiveUnlock(moduleId: MonetizableModuleId): boolean {
+    const govFree = AccountGovernanceService.isCurrentUserFreeForModule(moduleId);
+    if (govFree.free) return true;
     const rule = this.getRule(moduleId);
     if (!rule.enabled) return true;
     const acc = AuthService.getAccount();

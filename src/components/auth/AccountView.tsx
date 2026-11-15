@@ -311,7 +311,7 @@ export const AccountView: React.FC<AccountViewProps> = ({
           />
         </section>
 
-        {/* Panel Admin Zero Trust & Monetisasi */}
+        {/* Panel Admin Zero Trust */}
         <section className="divide-y divide-slate-200">
           <div className="px-4 py-2.5 bg-slate-50 text-[11px] font-bold text-slate-500 uppercase tracking-wider">
             Konsol Developer &amp; Keamanan
@@ -324,10 +324,10 @@ export const AccountView: React.FC<AccountViewProps> = ({
               <ShieldAlert className="w-4 h-4 mt-0.5 text-slate-900 shrink-0" />
               <div>
                 <div className="text-xs font-extrabold text-slate-900">
-                  Panel Admin Zero Trust &amp; Monetisasi
+                  Panel Admin Zero Trust
                 </div>
                 <div className="text-[11px] text-slate-500 mt-0.5">
-                  On/Off tarif modul, TF QRCode Developer, Statistik &amp; Pemulihan HP Hilang/Rusak
+                  Kontrol Keamanan Perangkat, Akses Akun, Smart Care &amp; Pemulihan HP
                 </div>
               </div>
             </div>

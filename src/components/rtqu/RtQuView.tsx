@@ -34,8 +34,10 @@ import {
   LogOut,
   Sparkles,
   Trash2,
-  Building2
+  Building2,
+  HelpCircle
 } from 'lucide-react';
+import { ModuleOnboardingService } from '../../services/moduleOnboardingService';
 import {
   RtSiagaStorage,
   RT_SYNC_EVENT,
@@ -64,6 +66,7 @@ import { RtExcelAndClaimSheet, ExtraSheetType } from './RtExcelAndClaimSheet';
 import { MonetizationService } from '../../services/monetizationService';
 import { EncryptedBackupPanel } from '../common/EncryptedBackupPanel';
 import { RealtimeRelayService } from '../../services/realtimeRelayService';
+import { InviteRelayService } from '../../services/inviteRelayService';
 
 interface RtQuViewProps {
   onBackToMain: () => void;
@@ -123,6 +126,7 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     orgType: OrgType;
   } | null>(null);
   const [compactInviteToken, setCompactInviteToken] = useState<string>('');
+  const [shortInviteUrl, setShortInviteUrl] = useState<string>('');
   const [createCommForm, setCreateCommForm] = useState<{
     orgType: OrgType;
     customBrandName: string;
@@ -399,23 +403,31 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     };
   }, [showNotification]);
 
-  // Generate compact invite token when invite modal opens
+  // Generate compact invite token & short 1-2 line URL when invite modal opens
   useEffect(() => {
     let cancelled = false;
     if (activeSheet === 'undang_komunitas' && activeCommunity) {
+      setShortInviteUrl('');
       RtSiagaStorage.encodeCommunityInviteCompact(activeCommunity, currentUser.name)
-        .then(tok => {
-          if (!cancelled) setCompactInviteToken(tok);
+        .then(async tok => {
+          if (cancelled) return;
+          setCompactInviteToken(tok);
+          const res = await InviteRelayService.createShortInviteLink('R', 'rt', tok);
+          if (!cancelled) setShortInviteUrl(res.url);
         })
-        .catch(() => {
-          if (!cancelled) {
-            setCompactInviteToken(
-              RtSiagaStorage.encodeCommunityInvite(activeCommunity, currentUser.name)
-            );
-          }
+        .catch(async () => {
+          if (cancelled) return;
+          const fallback = RtSiagaStorage.encodeCommunityInvite(
+            activeCommunity,
+            currentUser.name
+          );
+          setCompactInviteToken(fallback);
+          const res = await InviteRelayService.createShortInviteLink('R', 'rt', fallback);
+          if (!cancelled) setShortInviteUrl(res.url);
         });
     } else {
       setCompactInviteToken('');
+      setShortInviteUrl('');
     }
     return () => {
       cancelled = true;
@@ -631,8 +643,8 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
           currentUser.name,
           updatedMember
         );
-        const url = `${window.location.origin}${window.location.pathname}?rt=${token}`;
-        shareUrlLine = `\n👉 Klik Link Auto-Gabung (Otomatis masuk & klaim data Anda):\n${url}\n`;
+        const res = await InviteRelayService.createShortInviteLink('R', 'rt', token);
+        shareUrlLine = `\n👉 Klik Link Auto-Gabung (Otomatis masuk & klaim data Anda):\n${res.url}\n`;
       } catch {
         // ignore compact url error
       }
@@ -737,9 +749,9 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
     showNotification('Undangan acara siap dibagikan.');
   };
 
-  const communityInviteUrl = compactInviteToken
-    ? `${window.location.origin}${window.location.pathname}?rt=${compactInviteToken}`
-    : '';
+  const communityInviteUrl =
+    shortInviteUrl ||
+    (compactInviteToken ? `${window.location.origin}/?rt=${compactInviteToken}` : '');
 
   return (
     <div className="w-full h-full bg-white overflow-hidden flex flex-col relative select-none text-slate-800">
@@ -794,34 +806,45 @@ export const RtQuView: React.FC<RtQuViewProps> = ({
             </div>
           </div>
 
-          {activeCommunity ? (
+          <div className="flex items-center gap-1.5 shrink-0">
             <button
-              onClick={() => {
-                if (isPengurusMode) {
-                  setIsPengurusMode(false);
-                  showNotification('Keluar dari Mode Pengurus');
-                } else {
-                  setActiveSheet('pin_pengurus');
-                }
-              }}
-              className={`min-h-[38px] px-2.5 py-1.5 rounded-lg border text-[11px] font-bold flex items-center gap-1.5 transition shrink-0 ${
-                isPengurusMode
-                  ? 'bg-emerald-700 text-white border-emerald-700'
-                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-              }`}
+              type="button"
+              onClick={() => ModuleOnboardingService.openGuide('rtqu')}
+              className="w-9 h-9 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 flex items-center justify-center transition"
+              title="Panduan & Manfaat RTQu / PaguyubanQu"
+              aria-label="Panduan RTQu"
             >
-              {isPengurusMode ? <Unlock className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
-              <span>{isPengurusMode ? 'Pengurus' : 'Mode Pengurus'}</span>
+              <HelpCircle className="w-4 h-4" />
             </button>
-          ) : (
-            <button
-              onClick={() => setActiveSheet('buat_komunitas')}
-              className="min-h-[38px] px-3 py-1.5 rounded-lg bg-emerald-700 text-white text-[11px] font-bold flex items-center gap-1 transition shrink-0"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Buat Baru</span>
-            </button>
-          )}
+            {activeCommunity ? (
+              <button
+                onClick={() => {
+                  if (isPengurusMode) {
+                    setIsPengurusMode(false);
+                    showNotification('Keluar dari Mode Pengurus');
+                  } else {
+                    setActiveSheet('pin_pengurus');
+                  }
+                }}
+                className={`min-h-[38px] px-2.5 py-1.5 rounded-lg border text-[11px] font-bold flex items-center gap-1.5 transition shrink-0 ${
+                  isPengurusMode
+                    ? 'bg-emerald-700 text-white border-emerald-700'
+                    : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                }`}
+              >
+                {isPengurusMode ? <Unlock className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
+                <span>{isPengurusMode ? 'Pengurus' : 'Mode Pengurus'}</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => setActiveSheet('buat_komunitas')}
+                className="min-h-[38px] px-3 py-1.5 rounded-lg bg-emerald-700 text-white text-[11px] font-bold flex items-center gap-1 transition shrink-0"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Buat Baru</span>
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Multi-Komunitas Paralel Bar (RTQu / PaguyubanQu / Organisasi / Sosial) */}

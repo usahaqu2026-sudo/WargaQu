@@ -13,6 +13,12 @@ import { LeluhurQuView } from './components/leluhurqu/LeluhurQuView';
 import { LoginModal } from './components/auth/LoginModal';
 import { AccountView } from './components/auth/AccountView';
 import { AdminZeroTrustView } from './components/admin/AdminZeroTrustView';
+import { ModuleGuideModal } from './components/common/ModuleGuideModal';
+import {
+  GuideModuleId,
+  ModuleOnboardingService,
+  OPEN_MODULE_GUIDE_EVENT,
+} from './services/moduleOnboardingService';
 
 import {
   TableItem,
@@ -27,6 +33,11 @@ import { AUTH_SYNC_EVENT, AuthAccount, AuthService } from './services/authServic
 import { RtSiagaStorage } from './services/rtSiagaStorage';
 import { ZeroTrustService, DeviceTrustStatus } from './services/zeroTrustService';
 import { MonetizationService, ModuleMonetizationRule } from './services/monetizationService';
+import { SmartCareLogEntry, SmartCareService } from './services/smartCareService';
+import {
+  ACCOUNT_GOV_SYNC_EVENT,
+  AccountGovernanceService,
+} from './services/accountGovernanceService';
 import {
   REALTIME_RELAY_EVENT,
   RelayIncomingEvent,
@@ -56,6 +67,19 @@ export default function App() {
   // Global Auth Identity (Email, Phone, Hidden Device ID)
   const [authAccount, setAuthAccount] = useState<AuthAccount | null>(() => AuthService.getAccount());
   const [loginModal, setLoginModal] = useState<{ open: boolean; reason?: string }>({ open: false });
+
+  // Dynamic Account Governance State (Normal / Free / Warning / Banned)
+  const [accountAccess, setAccountAccess] = useState(() =>
+    AccountGovernanceService.evaluateCurrentAccountAccess()
+  );
+  const [warningDismissed, setWarningDismissed] = useState(false);
+
+  // Module 1x First-Visit & On-Demand Guide Modal State
+  const [moduleGuideState, setModuleGuideState] = useState<{
+    open: boolean;
+    moduleId: GuideModuleId | null;
+    isFirstVisit: boolean;
+  }>({ open: false, moduleId: null, isFirstVisit: false });
 
   // Global Toast Notification State
   const [notification, setNotification] = useState<string | null>(null);
@@ -146,6 +170,16 @@ export default function App() {
       ZeroTrustService.registerOrTouchCurrentDevice(currentAcc.email, currentAcc.phone);
     }
 
+    const refreshGovernanceState = () => {
+      const nextEval = AccountGovernanceService.evaluateCurrentAccountAccess();
+      setAccountAccess(prev => {
+        if (prev.warningNote !== nextEval.warningNote || prev.status !== nextEval.status) {
+          setWarningDismissed(false);
+        }
+        return nextEval;
+      });
+    };
+
     const handleAuthSync = () => {
       const nextAcc = AuthService.getAccount();
       setAuthAccount(nextAcc);
@@ -158,11 +192,18 @@ export default function App() {
           return updated;
         });
       }
+      refreshGovernanceState();
+      AccountGovernanceService.publishCurrentPresence(currentScreenRef.current);
     };
 
     window.addEventListener(AUTH_SYNC_EVENT, handleAuthSync);
+    window.addEventListener(ACCOUNT_GOV_SYNC_EVENT, refreshGovernanceState);
 
     RealtimeRelayService.start();
+    AccountGovernanceService.publishCurrentPresence(currentScreenRef.current);
+    const presenceInterval = window.setInterval(() => {
+      AccountGovernanceService.publishCurrentPresence(currentScreenRef.current);
+    }, 60000);
 
     const handleGlobalRelay = (evt: Event) => {
       const detail = (evt as CustomEvent<RelayIncomingEvent>).detail;
@@ -170,6 +211,10 @@ export default function App() {
 
       if (detail.eventName === 'admin:monetize_rules' && Array.isArray(detail.payload)) {
         MonetizationService.applyRemoteRules(detail.payload as ModuleMonetizationRule[]);
+      } else if (detail.eventName === 'admin:account_policies' && detail.payload) {
+        AccountGovernanceService.applyRemotePolicies(detail.payload);
+      } else if (detail.eventName === 'presence:heartbeat' && detail.payload) {
+        AccountGovernanceService.ingestRemotePresence(detail.payload);
       } else if (detail.eventName === 'zt:device_freeze' && detail.payload && typeof detail.payload === 'object') {
         const p = detail.payload as { deviceId?: string; status?: DeviceTrustStatus; reason?: string };
         if (p.deviceId && p.status) {
@@ -217,6 +262,14 @@ export default function App() {
         showNotification(
           `Order MuamalahQu baru dari ${p.buyerName || 'Warga'} (Rp ${(p.total || 0).toLocaleString('id-ID')})`
         );
+      } else if (detail.eventName === 'smartcare:ticket' && detail.payload && typeof detail.payload === 'object') {
+        if (SmartCareService.isDeveloperOrAdmin() || ZeroTrustService.isAdminSessionActive()) {
+          const entry = detail.payload as SmartCareLogEntry;
+          SmartCareService.ingestRemoteReport(entry);
+          showNotification(
+            `Laporan Smart Care baru (${entry.id}) dari ${entry.reporterName}: "${entry.complaint.slice(0, 45)}..."`
+          );
+        }
       }
     };
     window.addEventListener(REALTIME_RELAY_EVENT, handleGlobalRelay);
@@ -234,8 +287,10 @@ export default function App() {
     setPrinterConfig(StorageService.getPrinterConfig());
 
     return () => {
+      window.clearInterval(presenceInterval);
       window.removeEventListener('hashchange', onHashInviteCheck);
       window.removeEventListener(AUTH_SYNC_EVENT, handleAuthSync);
+      window.removeEventListener(ACCOUNT_GOV_SYNC_EVENT, refreshGovernanceState);
       window.removeEventListener(REALTIME_RELAY_EVENT, handleGlobalRelay);
     };
   }, []);
@@ -252,7 +307,39 @@ export default function App() {
 
   useEffect(() => {
     currentScreenRef.current = currentScreen;
-  }, [currentScreen]);
+    AccountGovernanceService.publishCurrentPresence(currentScreen);
+
+    if (accountAccess.status === 'banned' && !accountAccess.isAdminProtected) {
+      return;
+    }
+
+    const screenToGuideMap: Partial<Record<AppScreen, GuideModuleId>> = {
+      leluhurqu: 'leluhurqu',
+      rtqu: 'rtqu',
+      areaqu: 'areaqu',
+      siagaqu: 'siagaqu',
+      muamalahqu: 'muamalahqu',
+      usahaqu: 'usahaqu',
+      modularqu: 'usahaqu',
+      chatqu: 'chatqu',
+    };
+    const guideId = screenToGuideMap[currentScreen];
+    if (guideId && !ModuleOnboardingService.hasSeen(guideId)) {
+      setModuleGuideState({ open: true, moduleId: guideId, isFirstVisit: true });
+    }
+  }, [currentScreen, accountAccess.status, accountAccess.isAdminProtected]);
+
+  useEffect(() => {
+    const onOpenGuide = (ev: Event) => {
+      const customEv = ev as CustomEvent<{ moduleId?: GuideModuleId }>;
+      const modId = customEv.detail?.moduleId;
+      if (modId) {
+        setModuleGuideState({ open: true, moduleId: modId, isFirstVisit: false });
+      }
+    };
+    window.addEventListener(OPEN_MODULE_GUIDE_EVENT, onOpenGuide);
+    return () => window.removeEventListener(OPEN_MODULE_GUIDE_EVENT, onOpenGuide);
+  }, []);
 
   // Tangani tombol Back HP / Browser di tingkat aplikasi
   useEffect(() => {
@@ -418,6 +505,58 @@ export default function App() {
 
   return (
     <AndroidFrame>
+      {/* Dynamic Admin Warning Banner */}
+      {accountAccess.status === 'warning' && !warningDismissed && !accountAccess.isAdminProtected && (
+        <div className="bg-amber-50 border-b border-amber-300 px-3.5 py-2.5 text-amber-950 flex items-start justify-between gap-2 shrink-0 z-40">
+          <div className="text-[11px] leading-snug">
+            <span className="font-extrabold uppercase tracking-wide text-amber-800 block">
+              Peringatan Resmi Admin
+            </span>
+            <span>{accountAccess.warningNote}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setWarningDismissed(true)}
+            className="px-2 py-1 text-[10px] font-bold bg-amber-200/80 hover:bg-amber-300 rounded-lg shrink-0"
+          >
+            Tutup
+          </button>
+        </div>
+      )}
+
+      {/* Dynamic Admin Banned Blocking Overlay */}
+      {accountAccess.status === 'banned' && !accountAccess.isAdminProtected && (
+        <div className="absolute inset-0 z-50 bg-slate-950/95 text-white flex flex-col items-center justify-center p-6 text-center">
+          <div className="max-w-sm w-full bg-slate-900 border border-rose-500/40 rounded-2xl p-6 space-y-4 shadow-2xl">
+            <div className="w-12 h-12 rounded-2xl bg-rose-500/20 border border-rose-500/40 flex items-center justify-center mx-auto text-rose-400 font-black text-xl">
+              !
+            </div>
+            <div>
+              <h2 className="text-base font-extrabold text-white">Akun Dibatasi (Banned)</h2>
+              <p className="text-xs text-slate-300 mt-1.5 leading-relaxed">
+                {accountAccess.banReason ||
+                  'Akses akun ini dinonaktifkan sementara oleh Admin Zero Trust.'}
+              </p>
+            </div>
+            <div className="text-[11px] text-slate-400 bg-slate-950/80 border border-slate-800 rounded-xl p-3">
+              Email: <span className="font-mono text-slate-200">{authAccount?.email || '-'}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                AuthService.logout();
+                setAccountAccess(AccountGovernanceService.evaluateCurrentAccountAccess());
+                setCurrentScreen('warga');
+                showNotification('Keluar dari akun yang dibatasi.');
+              }}
+              className="w-full min-h-[42px] bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold"
+            >
+              Keluar / Ganti Akun
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Pop-up Notification Toast across views */}
       {notification && (
         <div className="absolute top-12 left-4 right-4 z-50 bg-emerald-950/95 text-[#5eead4] px-4 py-2 rounded-2xl shadow-xl border border-emerald-500/40 text-xs font-semibold flex items-center justify-between animate-in fade-in slide-in-from-top duration-200">
@@ -600,6 +739,17 @@ export default function App() {
         reasonMessage={loginModal.reason}
         onClose={() => setLoginModal({ open: false })}
         onSuccess={() => setLoginModal({ open: false })}
+        showNotification={showNotification}
+      />
+
+      {/* Global 1x First-Visit / On-Demand Module Guide Modal */}
+      <ModuleGuideModal
+        isOpen={moduleGuideState.open}
+        moduleId={moduleGuideState.moduleId}
+        isFirstVisit={moduleGuideState.isFirstVisit}
+        onClose={() =>
+          setModuleGuideState((prev) => ({ ...prev, open: false }))
+        }
         showNotification={showNotification}
       />
     </AndroidFrame>

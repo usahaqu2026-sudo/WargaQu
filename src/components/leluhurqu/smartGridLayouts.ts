@@ -494,6 +494,7 @@ export function generateSmartLayoutFromTable(
           y: Math.round(curY),
           photo: m.photoUrl || '',
           wafat: m.isDeceased,
+          gender: m.gender,
           memberId: m.id,
           genLevel: sr.genIndex,
         });
@@ -514,6 +515,7 @@ export function generateSmartLayoutFromTable(
             y: Math.round(curY),
             photo: '',
             wafat: sp.status === 'cerai_mati',
+            gender: m.gender === 'L' ? 'P' : m.gender === 'P' ? 'L' : undefined,
             genLevel: sr.genIndex,
           });
           edges.push({ from: primaryId, to: spId, type: 'couple' });
@@ -630,6 +632,7 @@ export function generateSmartLayoutFromTable(
         y: Math.round(topY),
         photo: m.photoUrl || '',
         wafat: m.isDeceased,
+        gender: m.gender,
         memberId: m.id,
         genLevel: depth,
       });
@@ -654,6 +657,7 @@ export function generateSmartLayoutFromTable(
           y: Math.round(topY),
           photo: '',
           wafat: sp.status === 'cerai_mati',
+          gender: m.gender === 'L' ? 'P' : m.gender === 'P' ? 'L' : undefined,
           genLevel: depth,
         });
         edges.push({ from: primaryId, to: spId, type: 'couple' });
@@ -770,6 +774,7 @@ export function generateSmartLayoutFromTable(
         y: Math.round(unitStartY),
         photo: m.photoUrl || '',
         wafat: m.isDeceased,
+        gender: m.gender,
         memberId: m.id,
         genLevel: depth,
       });
@@ -794,6 +799,7 @@ export function generateSmartLayoutFromTable(
           y: Math.round(unitStartY + (sIdx + 1) * (cardH + spouseGapY)),
           photo: '',
           wafat: sp.status === 'cerai_mati',
+          gender: m.gender === 'L' ? 'P' : m.gender === 'P' ? 'L' : undefined,
           genLevel: depth,
         });
         edges.push({ from: primaryId, to: spId, type: 'couple' });
@@ -884,6 +890,7 @@ export function generateSmartLayoutFromTable(
         y: Math.round(cursorY),
         photo: parent.photoUrl || '',
         wafat: parent.isDeceased,
+        gender: parent.gender,
         memberId: parent.id,
         genLevel: parentGen,
       });
@@ -898,6 +905,7 @@ export function generateSmartLayoutFromTable(
           y: Math.round(cursorY),
           photo: '',
           wafat: sp.status === 'cerai_mati',
+          gender: parent.gender === 'L' ? 'P' : parent.gender === 'P' ? 'L' : undefined,
           genLevel: parentGen,
         });
         edges.push({ from: parentNodeId!, to: spId, type: 'couple' });
@@ -924,6 +932,7 @@ export function generateSmartLayoutFromTable(
           y: Math.round(kidsY),
           photo: kid.photoUrl || '',
           wafat: kid.isDeceased,
+          gender: kid.gender,
           memberId: kid.id,
           genLevel: kidGen,
         });
@@ -954,6 +963,7 @@ export function generateSmartLayoutFromTable(
       y: Math.round(cursorY),
       photo: m.photoUrl || '',
       wafat: m.isDeceased,
+      gender: m.gender,
       memberId: m.id,
       genLevel: gen,
     });

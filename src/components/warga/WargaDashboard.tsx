@@ -487,25 +487,49 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
         </div>
 
         {/* ANNOUNCEMENT / BANNER CAROUSEL */}
-        <div
-          onClick={() => onOpenRtQu('forum')}
-          className="bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-700 rounded-xl p-3.5 text-white shadow-sm flex items-center justify-between cursor-pointer hover:opacity-95 active:scale-[0.99] transition border border-emerald-500/30"
-        >
-          <div className="space-y-0.5">
-            <div className="inline-block bg-amber-400 text-slate-900 text-[10px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider">
-              Kegiatan Warga
+        {hasRtCommunity ? (
+          <div
+            onClick={() => onOpenRtQu('forum')}
+            className="bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-700 rounded-xl p-3.5 text-white shadow-sm flex items-center justify-between cursor-pointer hover:opacity-95 active:scale-[0.99] transition border border-emerald-500/30"
+          >
+            <div className="space-y-0.5 min-w-0 pr-2">
+              <div className="inline-block bg-amber-400 text-slate-900 text-[10px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider">
+                Kegiatan {rtProfile.orgName}
+              </div>
+              <h4 className="text-xs font-bold leading-tight truncate">
+                {RtSiagaStorage.getForumPosts()[0]?.title || 'Gotong Royong & Rapat Warga'}
+              </h4>
+              <p className="text-[11px] text-emerald-100">Lihat Jadwal &amp; RSVP di Forum &gt;</p>
             </div>
-            <h4 className="text-xs font-bold leading-tight">Gotong Royong Minggu Ini!</h4>
-            <p className="text-[11px] text-emerald-100">Lihat Jadwal &amp; RSVP di Forum RT &gt;</p>
+            <div className="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center shrink-0">
+              <Sparkles className="w-5 h-5 text-amber-300" />
+            </div>
           </div>
-          <div className="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center shrink-0">
-            <Sparkles className="w-5 h-5 text-amber-300" />
+        ) : (
+          <div
+            onClick={() => onOpenRtQu('ringkasan')}
+            className="bg-gradient-to-r from-emerald-700 via-teal-700 to-emerald-800 rounded-xl p-3.5 text-white shadow-sm flex items-center justify-between cursor-pointer hover:opacity-95 active:scale-[0.99] transition border border-emerald-500/30"
+          >
+            <div className="space-y-0.5 min-w-0 pr-2">
+              <div className="inline-block bg-amber-400 text-slate-900 text-[10px] font-black px-1.5 py-0.5 rounded uppercase tracking-wider">
+                Khusus Undangan &amp; Mandiri
+              </div>
+              <h4 className="text-xs font-bold leading-tight">
+                Buat RT / Paguyuban / DKM Baru atau Gabung Undangan
+              </h4>
+              <p className="text-[11px] text-emerald-100">
+                Data tersimpan aman di HP Anda tanpa database pusat &gt;
+              </p>
+            </div>
+            <div className="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center shrink-0">
+              <Sparkles className="w-5 h-5 text-amber-300" />
+            </div>
           </div>
-        </div>
+        )}
 
         {/* EXTRA FEATURE STRIP (NFC / QUICK BAYAR BANNER) */}
         <div
-          onClick={() => onOpenRtQu('iuran')}
+          onClick={() => onOpenRtQu(hasRtCommunity ? 'iuran' : 'ringkasan')}
           className="bg-white rounded-xl p-3 border border-emerald-100/90 flex items-center justify-between shadow-xs cursor-pointer hover:bg-emerald-50/50 active:scale-[0.99] transition"
         >
           <div className="flex items-center gap-3">
@@ -513,8 +537,14 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
               <QrCode className="w-5 h-5" />
             </div>
             <div>
-              <h5 className="text-xs font-bold text-slate-800">Bayar Iuran via WargaPay</h5>
-              <p className="text-[10px] text-slate-500">Scan QRIS atau Transfer Otomatis</p>
+              <h5 className="text-xs font-bold text-slate-800">
+                {hasRtCommunity ? 'Bayar Iuran via WargaPay' : 'Kelola Iuran & Kas Komunitas'}
+              </h5>
+              <p className="text-[10px] text-slate-500">
+                {hasRtCommunity
+                  ? 'Scan QRIS atau Transfer Otomatis'
+                  : 'Aktif otomatis setelah gabung atau buat komunitas RTQu'}
+              </p>
             </div>
           </div>
           <ChevronRight className="w-4 h-4 text-emerald-600" />
@@ -542,26 +572,31 @@ export const WargaDashboard: React.FC<WargaDashboardProps> = ({
           <ChevronRight className="w-4 h-4 text-emerald-400" />
         </div>
 
-        {/* LATEST NEWS / COMMUNITY INFO */}
-        <div className="bg-white rounded-2xl p-4 shadow-sm border border-emerald-100/90 space-y-3">
-          <h3 className="font-bold text-emerald-900 text-xs uppercase tracking-wider">
-            Kabar RT 03
-          </h3>
-          <div
-            onClick={() => onOpenChatQu('announcements')}
-            className="flex gap-3 items-center cursor-pointer hover:opacity-85 transition"
-          >
-            <div className="w-12 h-12 bg-emerald-50 border border-emerald-100 rounded-lg shrink-0 flex items-center justify-center text-emerald-700">
-              <Newspaper className="w-6 h-6" />
-            </div>
-            <div className="space-y-0.5">
-              <p className="text-xs font-semibold text-slate-800 line-clamp-1">
-                Jadwal Ronda Malam Bulan Ini Telah Diperbarui
-              </p>
-              <p className="text-[10px] text-slate-400">2 Jam yang lalu • Buka Warta RT &gt;</p>
+        {/* LATEST NEWS / COMMUNITY INFO (ONLY IF JOINED) */}
+        {hasRtCommunity && (
+          <div className="bg-white rounded-2xl p-4 shadow-sm border border-emerald-100/90 space-y-3">
+            <h3 className="font-bold text-emerald-900 text-xs uppercase tracking-wider">
+              Kabar {rtProfile.orgName}
+            </h3>
+            <div
+              onClick={() => onOpenRtQu('forum')}
+              className="flex gap-3 items-center cursor-pointer hover:opacity-85 transition"
+            >
+              <div className="w-12 h-12 bg-emerald-50 border border-emerald-100 rounded-lg shrink-0 flex items-center justify-center text-emerald-700">
+                <Newspaper className="w-6 h-6" />
+              </div>
+              <div className="space-y-0.5 min-w-0">
+                <p className="text-xs font-semibold text-slate-800 line-clamp-1">
+                  {RtSiagaStorage.getForumPosts()[0]?.title ||
+                    `Pembaruan Info & Agenda ${rtProfile.orgName}`}
+                </p>
+                <p className="text-[10px] text-slate-400">
+                  {RtSiagaStorage.getForumPosts()[0]?.createdAt || 'Terbaru'} • Buka Forum &gt;
+                </p>
+              </div>
             </div>
           </div>
-        </div>
+        )}
       </div>
 
       {/* BOTTOM NAVIGATION BAR WITH FLOATING QRIS BUTTON */}

@@ -33,8 +33,10 @@ import {
   Crosshair,
   Sparkles,
   Lock,
-  ShieldCheck
+  ShieldCheck,
+  HelpCircle
 } from 'lucide-react';
+import { ModuleOnboardingService } from '../../services/moduleOnboardingService';
 import {
   RtSiagaStorage,
   RT_SYNC_EVENT,
@@ -858,10 +860,21 @@ export const SiagaQuView: React.FC<SiagaQuViewProps> = ({
             </p>
           </div>
 
-          {/* GPS Status Badge */}
-          <div className="flex items-center space-x-1 bg-emerald-950/60 border border-emerald-500/30 text-emerald-400 px-2 py-1 rounded-full text-[10px] font-bold">
-            <MapPin className="w-3 h-3 text-emerald-400 animate-pulse" />
-            <span>GPS Lock</span>
+          {/* GPS Status & Guide Button */}
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => ModuleOnboardingService.openGuide('siagaqu')}
+              className="w-8 h-8 rounded-full bg-slate-800 border border-slate-700 hover:bg-slate-700 active:scale-95 flex items-center justify-center text-slate-300 transition"
+              title="Panduan & Manfaat SiagaQu"
+              aria-label="Panduan SiagaQu"
+            >
+              <HelpCircle className="w-4 h-4" />
+            </button>
+            <div className="flex items-center space-x-1 bg-emerald-950/60 border border-emerald-500/30 text-emerald-400 px-2 py-1 rounded-full text-[10px] font-bold">
+              <MapPin className="w-3 h-3 text-emerald-400 animate-pulse" />
+              <span>GPS Lock</span>
+            </div>
           </div>
         </div>
 

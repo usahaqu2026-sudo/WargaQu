@@ -48,7 +48,45 @@ async function startServer() {
   const clients = new Set<ConnectedClient>();
   const channelSubscribers = new Map<string, Set<ConnectedClient>>();
   let volatileMonetizeRules: unknown = null;
+  let volatileAccountPolicies: unknown = null;
   const volatileFrozenDeviceMasks = new Set<string>();
+  const volatileInviteTickets = new Map<string, { payload: string; expiresAt: number }>();
+  const volatilePresenceMap = new Map<
+    string,
+    { data: Record<string, unknown>; lastSeenMs: number }
+  >();
+  const TICKET_TTL_MS = 72 * 60 * 60 * 1000;
+  const PRESENCE_TTL_MS = 24 * 60 * 60 * 1000;
+  const MAX_VOLATILE_TICKETS = 500;
+  const MAX_VOLATILE_PRESENCE = 1000;
+
+  function pruneExpiredPresence() {
+    const now = Date.now();
+    for (const [k, v] of volatilePresenceMap.entries()) {
+      if (now - v.lastSeenMs > PRESENCE_TTL_MS) {
+        volatilePresenceMap.delete(k);
+      }
+    }
+    while (volatilePresenceMap.size > MAX_VOLATILE_PRESENCE) {
+      const oldestKey = volatilePresenceMap.keys().next().value;
+      if (!oldestKey) break;
+      volatilePresenceMap.delete(oldestKey);
+    }
+  }
+
+  function pruneExpiredTickets() {
+    const now = Date.now();
+    for (const [k, v] of volatileInviteTickets.entries()) {
+      if (v.expiresAt <= now) {
+        volatileInviteTickets.delete(k);
+      }
+    }
+    while (volatileInviteTickets.size > MAX_VOLATILE_TICKETS) {
+      const oldestKey = volatileInviteTickets.keys().next().value;
+      if (!oldestKey) break;
+      volatileInviteTickets.delete(oldestKey);
+    }
+  }
 
   function subscribeClient(client: ConnectedClient, channel: string) {
     const clean = channel.trim();
@@ -134,6 +172,18 @@ async function startServer() {
                 })
               );
             }
+            if (volatileAccountPolicies) {
+              ws.send(
+                JSON.stringify({
+                  type: 'relay:event',
+                  eventId: `accgov-init-${Date.now()}`,
+                  channel: 'admin:policy',
+                  eventName: 'admin:account_policies',
+                  payload: volatileAccountPolicies,
+                  sentAt: new Date().toISOString(),
+                })
+              );
+            }
             if (volatileFrozenDeviceMasks.size > 0) {
               ws.send(
                 JSON.stringify({
@@ -151,9 +201,22 @@ async function startServer() {
         }
 
         if (msg.type === 'relay:publish' && msg.channel && msg.eventName) {
-          // Keep ONLY ephemeral admin rules / device freeze list in RAM; citizen payloads are never stored
+          // Keep ONLY ephemeral admin rules / device freeze list / active presence in RAM; zero DB/disk
           if (msg.eventName === 'admin:monetize_rules' && msg.payload) {
             volatileMonetizeRules = msg.payload;
+          } else if (msg.eventName === 'admin:account_policies' && msg.payload) {
+            volatileAccountPolicies = msg.payload;
+          } else if (
+            msg.eventName === 'presence:heartbeat' &&
+            msg.payload &&
+            typeof msg.payload === 'object'
+          ) {
+            const p = msg.payload as Record<string, unknown>;
+            const key = typeof p.accountKey === 'string' ? p.accountKey.trim() : '';
+            if (key) {
+              pruneExpiredPresence();
+              volatilePresenceMap.set(key, { data: p, lastSeenMs: Date.now() });
+            }
           } else if (
             msg.eventName === 'zt:device_freeze' &&
             msg.payload &&
@@ -195,14 +258,62 @@ async function startServer() {
     });
   });
 
+  // Ephemeral RAM-only Invite Link Transit (zero disk / zero DB, purely for short 1-2 line URLs)
+  app.post('/api/relay-ticket', (req, res) => {
+    const body = req.body as { payload?: unknown; prefix?: unknown };
+    const payload = typeof body?.payload === 'string' ? body.payload.trim() : '';
+    const rawPrefix = typeof body?.prefix === 'string' ? body.prefix.replace(/[^A-Za-z]/g, '').slice(0, 1).toUpperCase() : 'T';
+    const prefix = rawPrefix === 'Q' || rawPrefix === 'R' ? rawPrefix : 'T';
+    if (!payload || payload.length > 220000) {
+      res.status(400).json({ error: 'Invalid payload' });
+      return;
+    }
+    pruneExpiredTickets();
+    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    let suffix = '';
+    for (let i = 0; i < 6; i++) {
+      suffix += chars[Math.floor(Math.random() * chars.length)];
+    }
+    const code = `${prefix}${suffix}`;
+    volatileInviteTickets.set(code, {
+      payload,
+      expiresAt: Date.now() + TICKET_TTL_MS,
+    });
+    res.json({ code });
+  });
+
+  app.get('/api/relay-ticket/:code', (req, res) => {
+    pruneExpiredTickets();
+    const code = String(req.params.code || '').trim();
+    const entry = volatileInviteTickets.get(code);
+    if (!entry) {
+      res.status(404).json({ error: 'Ticket expired or not found' });
+      return;
+    }
+    res.json({ payload: entry.payload });
+  });
+
+  // Ephemeral RAM-only active presence snapshot for Admin Zero Trust live monitoring
+  app.get('/api/relay-presence', (_req, res) => {
+    pruneExpiredPresence();
+    res.json({
+      mode: 'volatile-ram-only',
+      connectedClients: clients.size,
+      entries: Array.from(volatilePresenceMap.values()).map(v => v.data),
+    });
+  });
+
   // Lightweight health endpoint (zero citizen PII)
   app.get('/api/relay-health', (_req, res) => {
+    pruneExpiredPresence();
     res.json({
       status: 'ok',
       mode: 'stateless-pass-through',
       citizenDatabaseStorage: 'none',
       connectedClients: clients.size,
       activeChannels: channelSubscribers.size,
+      activeTransitTickets: volatileInviteTickets.size,
+      activePresenceRamCount: volatilePresenceMap.size,
     });
   });
 
